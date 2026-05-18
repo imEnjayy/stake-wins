@@ -1,0 +1,981 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Stake Wins Archive</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #0d1922;
+    --panel: #15242f;
+    --panel-2: #1a2c38;
+    --border: #2f4553;
+    --border-soft: #213743;
+    --text: #ffffff;
+    --text-dim: #b1bad3;
+    --text-fade: #6c7a89;
+    --accent: #00e701;
+    --accent-glow: rgba(0, 231, 1, 0.15);
+    --warn: #ff9d00;
+    --danger: #ff4757;
+    --mono: 'JetBrains Mono', ui-monospace, monospace;
+    --sans: 'Plus Jakarta Sans', system-ui, sans-serif;
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--sans);
+    font-size: 14px;
+    line-height: 1.5;
+    min-height: 100vh;
+    background-image:
+      radial-gradient(ellipse 80% 50% at 50% -20%, rgba(0, 231, 1, 0.06), transparent),
+      linear-gradient(180deg, var(--bg) 0%, #0a141c 100%);
+    background-attachment: fixed;
+  }
+
+  /* ---- Header ---- */
+  header {
+    padding: 32px 40px 24px;
+    border-bottom: 1px solid var(--border-soft);
+    display: flex;
+    align-items: flex-end;
+    justify-content: space-between;
+    gap: 24px;
+    flex-wrap: wrap;
+  }
+  .brand {
+    display: flex;
+    align-items: baseline;
+    gap: 12px;
+  }
+  .brand h1 {
+    font-size: 28px;
+    font-weight: 800;
+    letter-spacing: -0.02em;
+  }
+  .brand .accent { color: var(--accent); }
+  .brand .tag {
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--text-fade);
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+  }
+  .header-stats {
+    display: flex;
+    gap: 28px;
+    flex-wrap: wrap;
+  }
+  .hstat {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+  .hstat .label {
+    font-family: var(--mono);
+    font-size: 10px;
+    color: var(--text-fade);
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+  }
+  .hstat .value {
+    font-family: var(--mono);
+    font-size: 18px;
+    font-weight: 700;
+    color: var(--text);
+  }
+
+  /* ---- Tabs ---- */
+  nav.tabs {
+    padding: 0 40px;
+    display: flex;
+    gap: 4px;
+    border-bottom: 1px solid var(--border-soft);
+    background: var(--panel);
+  }
+  nav.tabs button {
+    background: transparent;
+    border: none;
+    color: var(--text-dim);
+    padding: 14px 20px;
+    font-family: var(--sans);
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+    border-bottom: 2px solid transparent;
+    transition: color 0.15s, border-color 0.15s;
+    margin-bottom: -1px;
+  }
+  nav.tabs button:hover { color: var(--text); }
+  nav.tabs button.active {
+    color: var(--accent);
+    border-bottom-color: var(--accent);
+  }
+
+  /* ---- Layout ---- */
+  main { padding: 32px 40px 80px; max-width: 1400px; margin: 0 auto; }
+  .panel-view { display: none; }
+  .panel-view.active { display: block; }
+
+  /* ---- Upload zone ---- */
+  .drop-zone {
+    border: 2px dashed var(--border);
+    border-radius: 12px;
+    padding: 64px 32px;
+    text-align: center;
+    transition: all 0.2s;
+    background: var(--panel);
+    cursor: pointer;
+  }
+  .drop-zone:hover, .drop-zone.dragover {
+    border-color: var(--accent);
+    background: var(--accent-glow);
+  }
+  .drop-zone h2 {
+    font-size: 22px;
+    margin-bottom: 8px;
+    font-weight: 700;
+  }
+  .drop-zone p { color: var(--text-dim); margin-bottom: 24px; }
+  .drop-zone .icon {
+    font-size: 48px;
+    margin-bottom: 16px;
+    opacity: 0.6;
+  }
+  input[type="file"] { display: none; }
+
+  .btn {
+    display: inline-block;
+    padding: 10px 18px;
+    background: var(--accent);
+    color: #0d1922;
+    border: none;
+    border-radius: 6px;
+    font-family: var(--sans);
+    font-weight: 700;
+    font-size: 13px;
+    cursor: pointer;
+    transition: transform 0.1s, filter 0.15s;
+  }
+  .btn:hover { filter: brightness(1.1); }
+  .btn:active { transform: scale(0.97); }
+  .btn.secondary {
+    background: var(--panel-2);
+    color: var(--text);
+    border: 1px solid var(--border);
+  }
+  .btn.secondary:hover { background: var(--border-soft); }
+  .btn.danger { background: var(--danger); color: white; }
+
+  /* ---- Upload progress ---- */
+  .progress {
+    margin-top: 24px;
+    background: var(--panel);
+    border: 1px solid var(--border-soft);
+    border-radius: 8px;
+    padding: 16px 20px;
+    display: none;
+  }
+  .progress.active { display: block; }
+  .progress-bar {
+    height: 6px;
+    background: var(--border-soft);
+    border-radius: 3px;
+    overflow: hidden;
+    margin: 12px 0 8px;
+  }
+  .progress-bar-fill {
+    height: 100%;
+    background: var(--accent);
+    width: 0%;
+    transition: width 0.2s;
+  }
+  .progress-text {
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--text-dim);
+  }
+  .progress-log {
+    margin-top: 12px;
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--text-fade);
+    max-height: 200px;
+    overflow-y: auto;
+    line-height: 1.6;
+  }
+
+  /* ---- Filters bar ---- */
+  .filter-bar {
+    display: flex;
+    gap: 12px;
+    margin-bottom: 24px;
+    flex-wrap: wrap;
+    align-items: center;
+  }
+  .filter-bar select, .filter-bar input {
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    color: var(--text);
+    padding: 9px 12px;
+    border-radius: 6px;
+    font-family: var(--sans);
+    font-size: 13px;
+    outline: none;
+  }
+  .filter-bar select:focus, .filter-bar input:focus { border-color: var(--accent); }
+  .filter-bar label {
+    font-family: var(--mono);
+    font-size: 10px;
+    color: var(--text-fade);
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    margin-right: -8px;
+  }
+
+  /* ---- Wins table ---- */
+  .table-wrap {
+    background: var(--panel);
+    border: 1px solid var(--border-soft);
+    border-radius: 10px;
+    overflow: hidden;
+  }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+  }
+  thead {
+    background: var(--panel-2);
+  }
+  th {
+    padding: 12px 16px;
+    text-align: left;
+    font-family: var(--mono);
+    font-size: 10px;
+    color: var(--text-fade);
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    font-weight: 600;
+    border-bottom: 1px solid var(--border-soft);
+  }
+  th.num { text-align: right; }
+  td {
+    padding: 13px 16px;
+    border-bottom: 1px solid var(--border-soft);
+    font-size: 13px;
+  }
+  td.num {
+    text-align: right;
+    font-family: var(--mono);
+    font-weight: 500;
+  }
+  td .mult {
+    font-family: var(--mono);
+    font-weight: 700;
+    color: var(--accent);
+  }
+  td .mult.big { font-size: 15px; }
+  tr:hover td { background: var(--panel-2); }
+  tr:last-child td { border-bottom: none; }
+  td .game-tag {
+    display: inline-block;
+    padding: 3px 8px;
+    background: var(--border-soft);
+    border-radius: 4px;
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--text-dim);
+  }
+  td .rank {
+    font-family: var(--mono);
+    color: var(--text-fade);
+    font-size: 11px;
+  }
+  td .currency {
+    font-family: var(--mono);
+    font-size: 10px;
+    color: var(--text-fade);
+    text-transform: uppercase;
+    margin-left: 4px;
+  }
+
+  /* ---- Game grid (overview) ---- */
+  .game-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+    gap: 16px;
+    margin-bottom: 32px;
+  }
+  .game-card {
+    background: var(--panel);
+    border: 1px solid var(--border-soft);
+    border-radius: 10px;
+    padding: 20px;
+    cursor: pointer;
+    transition: border-color 0.15s, transform 0.15s;
+  }
+  .game-card:hover {
+    border-color: var(--accent);
+    transform: translateY(-2px);
+  }
+  .game-card h3 {
+    font-size: 16px;
+    margin-bottom: 16px;
+    text-transform: capitalize;
+  }
+  .game-card-stats {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 12px;
+  }
+  .game-card-stat {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+  .game-card-stat .label {
+    font-family: var(--mono);
+    font-size: 9px;
+    color: var(--text-fade);
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+  }
+  .game-card-stat .value {
+    font-family: var(--mono);
+    font-size: 16px;
+    font-weight: 700;
+  }
+  .game-card-stat .value.green { color: var(--accent); }
+
+  /* ---- Empty state ---- */
+  .empty {
+    text-align: center;
+    padding: 80px 20px;
+    color: var(--text-dim);
+  }
+  .empty h2 { font-size: 20px; margin-bottom: 8px; color: var(--text); }
+
+  /* ---- Settings ---- */
+  .settings-row {
+    background: var(--panel);
+    border: 1px solid var(--border-soft);
+    border-radius: 10px;
+    padding: 20px;
+    margin-bottom: 12px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 20px;
+  }
+  .settings-row .info h3 {
+    font-size: 14px;
+    margin-bottom: 4px;
+  }
+  .settings-row .info p {
+    color: var(--text-dim);
+    font-size: 12px;
+  }
+
+  /* ---- Toast ---- */
+  .toast {
+    position: fixed;
+    bottom: 24px;
+    right: 24px;
+    background: var(--panel-2);
+    border: 1px solid var(--accent);
+    color: var(--text);
+    padding: 12px 18px;
+    border-radius: 8px;
+    font-size: 13px;
+    box-shadow: 0 8px 24px rgba(0,0,0,.4);
+    opacity: 0;
+    transform: translateY(10px);
+    transition: opacity 0.2s, transform 0.2s;
+    pointer-events: none;
+    z-index: 1000;
+  }
+  .toast.show { opacity: 1; transform: translateY(0); }
+
+  /* Scrollbar */
+  ::-webkit-scrollbar { width: 10px; height: 10px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 5px; }
+  ::-webkit-scrollbar-thumb:hover { background: var(--border-soft); }
+
+  @media (max-width: 720px) {
+    header, nav.tabs, main { padding-left: 20px; padding-right: 20px; }
+    .header-stats { gap: 16px; }
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="brand">
+    <h1>stake<span class="accent">.</span>wins</h1>
+    <span class="tag">personal bet archive</span>
+  </div>
+  <div class="header-stats" id="header-stats">
+    <div class="hstat"><span class="label">Total Bets</span><span class="value" id="stat-total">—</span></div>
+    <div class="hstat"><span class="label">Games</span><span class="value" id="stat-games">—</span></div>
+    <div class="hstat"><span class="label">Biggest Multi</span><span class="value" id="stat-multi">—</span></div>
+    <div class="hstat"><span class="label">Date Range</span><span class="value" id="stat-range" style="font-size:13px">—</span></div>
+  </div>
+</header>
+
+<nav class="tabs">
+  <button class="active" data-tab="overview">Overview</button>
+  <button data-tab="wins">Top Wins</button>
+  <button data-tab="upload">Upload</button>
+  <button data-tab="settings">Settings</button>
+</nav>
+
+<main>
+
+  <!-- OVERVIEW -->
+  <section class="panel-view active" id="view-overview">
+    <div id="overview-content">
+      <div class="empty">
+        <h2>No data yet</h2>
+        <p>Upload your first bet archive to get started.</p>
+        <br>
+        <button class="btn" onclick="switchTab('upload')">Upload Archive</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- TOP WINS -->
+  <section class="panel-view" id="view-wins">
+    <div class="filter-bar">
+      <label>Game</label>
+      <select id="filter-game"><option value="">All games</option></select>
+      <label>Sort By</label>
+      <select id="filter-sort">
+        <option value="multi">Multiplier</option>
+        <option value="payout">Payout</option>
+        <option value="profit">Profit</option>
+      </select>
+      <label>Show</label>
+      <select id="filter-limit">
+        <option value="50">Top 50</option>
+        <option value="100">Top 100</option>
+        <option value="500">Top 500</option>
+        <option value="all">All wins</option>
+      </select>
+    </div>
+    <div id="wins-content">
+      <div class="empty"><p>No wins to show.</p></div>
+    </div>
+  </section>
+
+  <!-- UPLOAD -->
+  <section class="panel-view" id="view-upload">
+    <div class="drop-zone" id="drop-zone">
+      <div class="icon">⬆</div>
+      <h2>Drop archive JSON files here</h2>
+      <p>Or click to browse. Multi-select is supported.</p>
+      <button class="btn">Choose Files</button>
+      <input type="file" id="file-input" multiple accept=".json,application/json">
+    </div>
+    <div class="progress" id="progress">
+      <div class="progress-text" id="progress-text">Processing…</div>
+      <div class="progress-bar"><div class="progress-bar-fill" id="progress-fill"></div></div>
+      <div class="progress-log" id="progress-log"></div>
+    </div>
+  </section>
+
+  <!-- SETTINGS -->
+  <section class="panel-view" id="view-settings">
+    <div class="settings-row">
+      <div class="info">
+        <h3>Export database</h3>
+        <p>Download all stored bets as a single JSON file for backup.</p>
+      </div>
+      <button class="btn secondary" id="btn-export">Export</button>
+    </div>
+    <div class="settings-row">
+      <div class="info">
+        <h3>Import database backup</h3>
+        <p>Restore from a previously exported backup file.</p>
+      </div>
+      <button class="btn secondary" id="btn-import">Import</button>
+      <input type="file" id="import-input" accept=".json">
+    </div>
+    <div class="settings-row">
+      <div class="info">
+        <h3>Clear all data</h3>
+        <p>Permanently delete all uploaded bets from this browser.</p>
+      </div>
+      <button class="btn danger" id="btn-clear">Clear</button>
+    </div>
+    <div class="settings-row">
+      <div class="info">
+        <h3>Storage info</h3>
+        <p id="storage-info">—</p>
+      </div>
+    </div>
+  </section>
+
+</main>
+
+<div class="toast" id="toast"></div>
+
+<script>
+'use strict';
+
+/* ==============================================================
+   DATABASE LAYER (IndexedDB)
+   ============================================================== */
+const DB_NAME = 'stake-wins';
+const DB_VERSION = 1;
+const STORE = 'bets';
+
+function openDB() {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(DB_NAME, DB_VERSION);
+    req.onupgradeneeded = () => {
+      const db = req.result;
+      if (!db.objectStoreNames.contains(STORE)) {
+        const s = db.createObjectStore(STORE, { keyPath: 'id' });
+        s.createIndex('gameName', 'gameName', { unique: false });
+        s.createIndex('createdAt', 'createdAt', { unique: false });
+        s.createIndex('payoutMultiplier', 'payoutMultiplier', { unique: false });
+      }
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+async function bulkPut(records) {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE, 'readwrite');
+    const store = tx.objectStore(STORE);
+    let inserted = 0, skipped = 0;
+    let pending = records.length;
+    if (!pending) return resolve({ inserted, skipped });
+    for (const r of records) {
+      const getReq = store.get(r.id);
+      getReq.onsuccess = () => {
+        if (getReq.result) { skipped++; }
+        else { store.add(r); inserted++; }
+        if (--pending === 0) resolve({ inserted, skipped });
+      };
+      getReq.onerror = () => { if (--pending === 0) resolve({ inserted, skipped }); };
+    }
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+async function getAllBets() {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const req = db.transaction(STORE, 'readonly').objectStore(STORE).getAll();
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+async function getBetsByGame(gameName) {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const idx = db.transaction(STORE, 'readonly').objectStore(STORE).index('gameName');
+    const req = idx.getAll(gameName);
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+async function clearAll() {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const req = db.transaction(STORE, 'readwrite').objectStore(STORE).clear();
+    req.onsuccess = () => resolve();
+    req.onerror = () => reject(req.error);
+  });
+}
+
+async function countBets() {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const req = db.transaction(STORE, 'readonly').objectStore(STORE).count();
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+/* ==============================================================
+   ARCHIVE PARSER
+   Stake archive format: array of { id, data: {...bet}, created_at }
+   We normalize each bet to a flat row for easy querying.
+   ============================================================== */
+function normalizeBet(raw) {
+  const d = raw.data || raw; // some formats may not have the wrapper
+  const id = d.id || raw.id;
+  if (!id) return null;
+  const amount = Number(d.amount) || 0;
+  const payout = Number(d.payout) || 0;
+  return {
+    id,                                            // dedup key (Stake bet UUID)
+    iid: d.iid || '',
+    gameName: d.gameName || 'unknown',
+    type: d.type || 'casino',
+    currency: (d.currency || '').toLowerCase(),
+    amount,
+    payout,
+    profit: payout - amount,
+    payoutMultiplier: Number(d.payoutMultiplier) || 0,
+    value: Number(d.value) || 0,                   // Stake-internal value field (not reliable USD)
+    createdAt: d.createdAt || (raw.created_at ? Date.parse(raw.created_at) : 0),
+    nonce: d.nonce || 0,
+    won: payout > 0,
+  };
+}
+
+async function ingestFile(file) {
+  const text = await file.text();
+  let data;
+  try { data = JSON.parse(text); }
+  catch (e) { throw new Error(`${file.name}: not valid JSON`); }
+  if (!Array.isArray(data)) throw new Error(`${file.name}: expected JSON array`);
+  const normalized = data.map(normalizeBet).filter(Boolean);
+  return await bulkPut(normalized);
+}
+
+/* ==============================================================
+   UI HELPERS
+   ============================================================== */
+const $ = sel => document.querySelector(sel);
+const $$ = sel => Array.from(document.querySelectorAll(sel));
+
+function toast(msg) {
+  const t = $('#toast');
+  t.textContent = msg;
+  t.classList.add('show');
+  clearTimeout(t._timer);
+  t._timer = setTimeout(() => t.classList.remove('show'), 2500);
+}
+
+function fmtNum(n, decimals = 2) {
+  if (n === 0) return '0';
+  if (Math.abs(n) >= 1) return n.toFixed(decimals);
+  if (Math.abs(n) >= 0.0001) return n.toFixed(6);
+  return n.toExponential(2);
+}
+
+function fmtDate(ts) {
+  if (!ts) return '—';
+  return new Date(ts).toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' });
+}
+
+function fmtUSD(v) {
+  if (!v) return '—';
+  return '$' + v.toFixed(2);
+}
+
+function switchTab(name) {
+  $$('nav.tabs button').forEach(b => b.classList.toggle('active', b.dataset.tab === name));
+  $$('.panel-view').forEach(v => v.classList.toggle('active', v.id === 'view-' + name));
+  if (name === 'overview') renderOverview();
+  if (name === 'wins') renderWins();
+  if (name === 'settings') renderStorageInfo();
+}
+$$('nav.tabs button').forEach(b => b.addEventListener('click', () => switchTab(b.dataset.tab)));
+
+/* ==============================================================
+   RENDER: HEADER STATS
+   ============================================================== */
+async function renderHeaderStats() {
+  const all = await getAllBets();
+  $('#stat-total').textContent = all.length.toLocaleString();
+  const games = new Set(all.map(b => b.gameName));
+  $('#stat-games').textContent = games.size;
+  const wins = all.filter(b => b.won);
+  if (wins.length) {
+    const top = wins.reduce((a, b) => a.payoutMultiplier > b.payoutMultiplier ? a : b);
+    $('#stat-multi').textContent = top.payoutMultiplier.toFixed(2) + '×';
+  } else {
+    $('#stat-multi').textContent = '—';
+  }
+  if (all.length) {
+    const dates = all.map(b => b.createdAt).filter(Boolean).sort();
+    $('#stat-range').textContent = `${fmtDate(dates[0])} → ${fmtDate(dates[dates.length-1])}`;
+  } else {
+    $('#stat-range').textContent = '—';
+  }
+}
+
+/* ==============================================================
+   RENDER: OVERVIEW (per-game cards)
+   ============================================================== */
+async function renderOverview() {
+  const all = await getAllBets();
+  const c = $('#overview-content');
+  if (!all.length) {
+    c.innerHTML = `<div class="empty">
+      <h2>No data yet</h2>
+      <p>Upload your first bet archive to get started.</p>
+      <br><button class="btn" onclick="switchTab('upload')">Upload Archive</button>
+    </div>`;
+    return;
+  }
+  // Group by game
+  const byGame = new Map();
+  for (const b of all) {
+    if (!byGame.has(b.gameName)) byGame.set(b.gameName, []);
+    byGame.get(b.gameName).push(b);
+  }
+  const cards = [...byGame.entries()]
+    .sort((a, b) => b[1].length - a[1].length)
+    .map(([game, bets]) => {
+      const wins = bets.filter(b => b.won);
+      const topMulti = wins.length ? Math.max(...wins.map(b => b.payoutMultiplier)) : 0;
+      // Most-used currency for this game
+      const curCounts = {};
+      bets.forEach(b => { curCounts[b.currency] = (curCounts[b.currency] || 0) + 1; });
+      const topCur = Object.entries(curCounts).sort((a, b) => b[1] - a[1])[0]?.[0] || '';
+      const inCur = bets.filter(b => b.currency === topCur);
+      const wagered = inCur.reduce((s, b) => s + b.amount, 0);
+      const won = inCur.reduce((s, b) => s + b.payout, 0);
+      const net = won - wagered;
+      return `<div class="game-card" data-game="${game}">
+        <h3>${game.replace(/-/g, ' ')}</h3>
+        <div class="game-card-stats">
+          <div class="game-card-stat"><span class="label">Bets</span><span class="value">${bets.length.toLocaleString()}</span></div>
+          <div class="game-card-stat"><span class="label">Wins</span><span class="value">${wins.length.toLocaleString()}</span></div>
+          <div class="game-card-stat"><span class="label">Top Multi</span><span class="value green">${topMulti ? topMulti.toFixed(2) + '×' : '—'}</span></div>
+          <div class="game-card-stat"><span class="label">Net (${topCur.toUpperCase()})</span><span class="value" style="color:${net >= 0 ? 'var(--accent)' : 'var(--danger)'}">${net >= 0 ? '+' : ''}${fmtNum(net, 4)}</span></div>
+        </div>
+      </div>`;
+    }).join('');
+  c.innerHTML = `<div class="game-grid">${cards}</div>`;
+  $$('.game-card').forEach(card => {
+    card.addEventListener('click', () => {
+      $('#filter-game').value = card.dataset.game;
+      switchTab('wins');
+    });
+  });
+}
+
+/* ==============================================================
+   RENDER: TOP WINS TABLE
+   ============================================================== */
+async function renderWins() {
+  // Populate game filter
+  const all = await getAllBets();
+  const games = [...new Set(all.map(b => b.gameName))].sort();
+  const sel = $('#filter-game');
+  const cur = sel.value;
+  sel.innerHTML = '<option value="">All games</option>' +
+    games.map(g => `<option value="${g}">${g.replace(/-/g, ' ')}</option>`).join('');
+  sel.value = cur || '';
+
+  const gameFilter = sel.value;
+  const sortBy = $('#filter-sort').value;
+  const limit = $('#filter-limit').value;
+
+  let bets = all.filter(b => b.won);
+  if (gameFilter) bets = bets.filter(b => b.gameName === gameFilter);
+
+  const sorters = {
+    multi:  (a, b) => b.payoutMultiplier - a.payoutMultiplier,
+    payout: (a, b) => b.payout - a.payout,
+    profit: (a, b) => b.profit - a.profit,
+  };
+  bets.sort(sorters[sortBy] || sorters.multi);
+  if (limit !== 'all') bets = bets.slice(0, parseInt(limit, 10));
+
+  const c = $('#wins-content');
+  if (!bets.length) {
+    c.innerHTML = `<div class="empty"><p>No wins to show${gameFilter ? ` for ${gameFilter}` : ''}.</p></div>`;
+    return;
+  }
+
+  c.innerHTML = `<div class="table-wrap"><table>
+    <thead><tr>
+      <th>#</th><th>Game</th>
+      <th class="num">Multi</th>
+      <th class="num">Bet</th>
+      <th class="num">Payout</th>
+      <th class="num">Profit</th>
+      <th class="num">Date</th>
+    </tr></thead>
+    <tbody>
+      ${bets.map((b, i) => `<tr>
+        <td><span class="rank">#${i+1}</span></td>
+        <td><span class="game-tag">${b.gameName}</span></td>
+        <td class="num"><span class="mult ${b.payoutMultiplier >= 100 ? 'big' : ''}">${b.payoutMultiplier.toFixed(2)}×</span></td>
+        <td class="num">${fmtNum(b.amount)}<span class="currency">${b.currency}</span></td>
+        <td class="num">${fmtNum(b.payout)}<span class="currency">${b.currency}</span></td>
+        <td class="num" style="color:${b.profit > 0 ? 'var(--accent)' : 'var(--text-dim)'}">${b.profit > 0 ? '+' : ''}${fmtNum(b.profit)}</td>
+        <td class="num" style="color:var(--text-dim)">${fmtDate(b.createdAt)}</td>
+      </tr>`).join('')}
+    </tbody>
+  </table></div>`;
+}
+
+['#filter-game', '#filter-sort', '#filter-limit'].forEach(s => {
+  $(s).addEventListener('change', renderWins);
+});
+
+/* ==============================================================
+   UPLOAD HANDLING
+   ============================================================== */
+async function handleFiles(fileList) {
+  const files = Array.from(fileList).filter(f => f.name.endsWith('.json'));
+  if (!files.length) { toast('No JSON files selected'); return; }
+
+  const prog = $('#progress');
+  prog.classList.add('active');
+  const log = $('#progress-log');
+  log.innerHTML = '';
+  let totalInserted = 0, totalSkipped = 0, totalErrors = 0;
+
+  for (let i = 0; i < files.length; i++) {
+    const f = files[i];
+    $('#progress-text').textContent = `Processing ${i+1} of ${files.length}: ${f.name}`;
+    try {
+      const { inserted, skipped } = await ingestFile(f);
+      totalInserted += inserted;
+      totalSkipped += skipped;
+      log.innerHTML += `<div>✓ ${f.name} — ${inserted} new, ${skipped} duplicate</div>`;
+    } catch (e) {
+      totalErrors++;
+      log.innerHTML += `<div style="color:var(--danger)">✗ ${f.name} — ${e.message}</div>`;
+    }
+    log.scrollTop = log.scrollHeight;
+    $('#progress-fill').style.width = ((i+1)/files.length*100) + '%';
+  }
+
+  $('#progress-text').textContent = `Done. ${totalInserted} bets added, ${totalSkipped} duplicates skipped${totalErrors ? `, ${totalErrors} errors` : ''}.`;
+  toast(`Added ${totalInserted} new bets`);
+  await renderHeaderStats();
+  if ($('#view-overview').classList.contains('active')) renderOverview();
+}
+
+const dropZone = $('#drop-zone');
+const fileInput = $('#file-input');
+dropZone.addEventListener('click', e => {
+  // Don't double-trigger when clicking the inner button
+  if (e.target.tagName !== 'BUTTON') fileInput.click();
+});
+dropZone.querySelector('button').addEventListener('click', e => {
+  e.stopPropagation();
+  fileInput.click();
+});
+fileInput.addEventListener('change', e => handleFiles(e.target.files));
+['dragenter', 'dragover'].forEach(ev => {
+  dropZone.addEventListener(ev, e => { e.preventDefault(); dropZone.classList.add('dragover'); });
+});
+['dragleave', 'drop'].forEach(ev => {
+  dropZone.addEventListener(ev, e => { e.preventDefault(); dropZone.classList.remove('dragover'); });
+});
+dropZone.addEventListener('drop', e => {
+  e.preventDefault();
+  handleFiles(e.dataTransfer.files);
+});
+
+/* ==============================================================
+   SETTINGS ACTIONS
+   ============================================================== */
+$('#btn-export').addEventListener('click', async () => {
+  const all = await getAllBets();
+  const blob = new Blob([JSON.stringify(all, null, 0)], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  const dt = new Date().toISOString().slice(0, 10);
+  a.href = url; a.download = `stake-wins-backup-${dt}.json`;
+  a.click();
+  URL.revokeObjectURL(url);
+  toast(`Exported ${all.length} bets`);
+});
+
+$('#btn-import').addEventListener('click', () => $('#import-input').click());
+$('#import-input').addEventListener('change', async e => {
+  const f = e.target.files[0]; if (!f) return;
+  try {
+    const text = await f.text();
+    const data = JSON.parse(text);
+    if (!Array.isArray(data)) throw new Error('Not an array');
+    // Backup files are already normalized — but to be safe, run through normalize
+    const recs = data.map(b => b.gameName ? b : normalizeBet(b)).filter(Boolean);
+    const { inserted, skipped } = await bulkPut(recs);
+    toast(`Imported ${inserted} bets (${skipped} duplicates)`);
+    await renderHeaderStats();
+    if ($('#view-overview').classList.contains('active')) renderOverview();
+  } catch (err) {
+    toast('Import failed: ' + err.message);
+  }
+});
+
+$('#btn-clear').addEventListener('click', async () => {
+  if (!confirm('Permanently delete all stored bets? This cannot be undone.')) return;
+  await clearAll();
+  toast('Cleared all data');
+  await renderHeaderStats();
+  renderOverview();
+});
+
+async function renderStorageInfo() {
+  const n = await countBets();
+  let extra = '';
+  if (navigator.storage && navigator.storage.estimate) {
+    try {
+      const est = await navigator.storage.estimate();
+      const used = (est.usage / 1024 / 1024).toFixed(1);
+      const quota = (est.quota / 1024 / 1024).toFixed(0);
+      extra = ` · ${used} MB used of ${quota} MB available`;
+    } catch (e) {}
+  }
+  $('#storage-info').textContent = `${n.toLocaleString()} bets stored${extra}`;
+}
+
+/* ==============================================================
+   USERSCRIPT BRIDGE
+   Listens for postMessage queries from the Tampermonkey script
+   running on stake.* sites. The userscript loads this page in a
+   hidden iframe and uses postMessage to read the IndexedDB.
+   ============================================================== */
+window.addEventListener('message', async (event) => {
+  const msg = event.data;
+  if (!msg || msg.source !== 'stake-wins-userscript') return;
+  const reply = (data) => event.source.postMessage(
+    { source: 'stake-wins-site', requestId: msg.requestId, data },
+    event.origin
+  );
+  try {
+    if (msg.type === 'ping') {
+      reply({ ok: true });
+    } else if (msg.type === 'topWinsForGame') {
+      const bets = await getBetsByGame(msg.gameName);
+      const wins = bets.filter(b => b.won)
+        .sort((a, b) => b.payoutMultiplier - a.payoutMultiplier)
+        .slice(0, msg.limit || 50);
+      reply({ ok: true, wins });
+    } else if (msg.type === 'gameStats') {
+      const bets = await getBetsByGame(msg.gameName);
+      reply({ ok: true, totalBets: bets.length, totalWins: bets.filter(b => b.won).length });
+    }
+  } catch (err) {
+    reply({ ok: false, error: err.message });
+  }
+});
+
+/* ==============================================================
+   INIT
+   ============================================================== */
+(async function init() {
+  await renderHeaderStats();
+  renderOverview();
+})();
+</script>
+</body>
+</html>
