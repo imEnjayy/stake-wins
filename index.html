@@ -963,6 +963,15 @@ window.addEventListener('message', async (event) => {
     } else if (msg.type === 'gameStats') {
       const bets = await getBetsByGame(msg.gameName);
       reply({ ok: true, totalBets: bets.length, totalWins: bets.filter(b => b.won).length });
+    } else if (msg.type === 'ingestArchive') {
+      // Bulk importer pipes raw archive arrays through this handler
+      if (!Array.isArray(msg.archive)) {
+        reply({ ok: false, error: 'Expected array' });
+        return;
+      }
+      const normalized = msg.archive.map(normalizeBet).filter(Boolean);
+      const { inserted, skipped } = await bulkPut(normalized);
+      reply({ ok: true, inserted, skipped, total: normalized.length });
     }
   } catch (err) {
     reply({ ok: false, error: err.message });
