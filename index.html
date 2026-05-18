@@ -92,6 +92,34 @@
     color: var(--text);
   }
 
+  .hstat-toggle .toggle-pill {
+    display: inline-flex;
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 2px;
+    gap: 2px;
+  }
+  .toggle-opt {
+    background: transparent;
+    border: none;
+    color: var(--text-dim);
+    font-family: var(--mono);
+    font-size: 11px;
+    font-weight: 700;
+    padding: 5px 10px;
+    border-radius: 4px;
+    cursor: pointer;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    transition: background 0.15s, color 0.15s;
+  }
+  .toggle-opt:hover { color: var(--text); }
+  .toggle-opt.active {
+    background: var(--accent);
+    color: #0d1922;
+  }
+
   /* ---- Tabs ---- */
   nav.tabs {
     padding: 0 40px;
@@ -305,6 +333,12 @@
     text-transform: uppercase;
     margin-left: 4px;
   }
+  td .no-price {
+    font-family: var(--mono);
+    font-size: 10px;
+    color: var(--warn);
+    opacity: 0.7;
+  }
 
   /* ---- Game grid (overview) ---- */
   .game-grid {
@@ -353,6 +387,25 @@
     font-weight: 700;
   }
   .game-card-stat .value.green { color: var(--accent); }
+  .game-card-dates {
+    margin-top: 14px;
+    padding-top: 12px;
+    border-top: 1px solid var(--border-soft);
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+  .game-card-dates .date-item {
+    font-family: var(--mono);
+    font-size: 10px;
+    color: var(--text-dim);
+  }
+  .game-card-dates .date-label {
+    color: var(--text-fade);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    margin-right: 6px;
+  }
 
   /* ---- Empty state ---- */
   .empty {
@@ -427,6 +480,13 @@
     <div class="hstat"><span class="label">Games</span><span class="value" id="stat-games">—</span></div>
     <div class="hstat"><span class="label">Biggest Multi</span><span class="value" id="stat-multi">—</span></div>
     <div class="hstat"><span class="label">Date Range</span><span class="value" id="stat-range" style="font-size:13px">—</span></div>
+    <div class="hstat hstat-toggle">
+      <span class="label">View Mode</span>
+      <div class="toggle-pill" id="currency-toggle">
+        <button class="toggle-opt active" data-mode="native">Native</button>
+        <button class="toggle-opt" data-mode="usd">USD</button>
+      </div>
+    </div>
   </div>
 </header>
 
@@ -495,6 +555,19 @@
   <section class="panel-view" id="view-settings">
     <div class="settings-row">
       <div class="info">
+        <h3>Fetch USD price history</h3>
+        <p>Downloads daily USD prices for LTC, BTC, ETH, SOL, XRP, USDT, USDC from CoinGecko's free API. Required for the USD view mode. Re-run weekly to refresh recent prices.</p>
+      </div>
+      <button class="btn" id="btn-fetch-prices">Fetch Prices</button>
+    </div>
+    <div class="settings-row">
+      <div class="info">
+        <h3>Price cache status</h3>
+        <p id="price-cache-info">—</p>
+      </div>
+    </div>
+    <div class="settings-row">
+      <div class="info">
         <h3>Export database</h3>
         <p>Download all stored bets as a single JSON file for backup.</p>
       </div>
@@ -534,19 +607,23 @@
    DATABASE LAYER (IndexedDB)
    ============================================================== */
 const DB_NAME = 'stake-wins';
-const DB_VERSION = 1;
+const DB_VERSION = 2;
 const STORE = 'bets';
+const PRICES_STORE = 'prices'; // { currency: 'ltc', dates: { 'YYYY-MM-DD': price } }
 
 function openDB() {
   return new Promise((resolve, reject) => {
     const req = indexedDB.open(DB_NAME, DB_VERSION);
-    req.onupgradeneeded = () => {
+    req.onupgradeneeded = (e) => {
       const db = req.result;
       if (!db.objectStoreNames.contains(STORE)) {
         const s = db.createObjectStore(STORE, { keyPath: 'id' });
         s.createIndex('gameName', 'gameName', { unique: false });
         s.createIndex('createdAt', 'createdAt', { unique: false });
         s.createIndex('payoutMultiplier', 'payoutMultiplier', { unique: false });
+      }
+      if (!db.objectStoreNames.contains(PRICES_STORE)) {
+        db.createObjectStore(PRICES_STORE, { keyPath: 'currency' });
       }
     };
     req.onsuccess = () => resolve(req.result);
@@ -612,6 +689,25 @@ async function countBets() {
   });
 }
 
+async function savePrices(currency, dates) {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(PRICES_STORE, 'readwrite');
+    tx.objectStore(PRICES_STORE).put({ currency, dates, updatedAt: Date.now() });
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+async function getAllPrices() {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const req = db.transaction(PRICES_STORE, 'readonly').objectStore(PRICES_STORE).getAll();
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
 /* ==============================================================
    ARCHIVE PARSER
    Stake archive format: array of { id, data: {...bet}, created_at }
@@ -636,7 +732,7 @@ function normalizeBet(raw) {
     value: Number(d.value) || 0,                   // Stake-internal value field (not reliable USD)
     createdAt: d.createdAt || (raw.created_at ? Date.parse(raw.created_at) : 0),
     nonce: d.nonce || 0,
-    won: payout > 0,
+    won: payout > amount,                          // actually profitable (not just any payout > 0)
   };
 }
 
@@ -656,6 +752,64 @@ async function ingestFile(file) {
 const $ = sel => document.querySelector(sel);
 const $$ = sel => Array.from(document.querySelectorAll(sel));
 
+// View mode: 'native' or 'usd'. Persists in localStorage.
+let viewMode = localStorage.getItem('sw-view-mode') || 'native';
+
+// In-memory price cache. Loaded once on startup.
+// Shape: { ltc: { '2024-01-15': 72.5, ... }, btc: {...}, ... }
+let priceCache = {};
+
+const SUPPORTED_CURRENCIES = {
+  ltc: 'litecoin',
+  btc: 'bitcoin',
+  eth: 'ethereum',
+  sol: 'solana',
+  xrp: 'ripple',
+  usdt: 'tether',
+  usdc: 'usd-coin',
+};
+
+async function loadPriceCache() {
+  const rows = await getAllPrices();
+  priceCache = {};
+  for (const row of rows) priceCache[row.currency] = row.dates;
+}
+
+// Convert (amount, currency, timestamp) to USD using historical price.
+// Returns null if we don't have price data for that day.
+function toUSD(amount, currency, timestamp) {
+  if (!amount) return 0;
+  const cur = (currency || '').toLowerCase();
+  // Stablecoins: 1:1 USD without needing price lookup
+  if (cur === 'usdt' || cur === 'usdc') return amount;
+  const dates = priceCache[cur];
+  if (!dates) return null;
+  const dateKey = isoDate(timestamp);
+  // Exact match
+  if (dates[dateKey] != null) return amount * dates[dateKey];
+  // Fall back to nearest available date (most useful for recent bets when
+  // prices haven't been refreshed yet, or older bets near the edge of our cache)
+  const allDates = Object.keys(dates).sort();
+  if (!allDates.length) return null;
+  // Find nearest by absolute date difference
+  const target = new Date(dateKey).getTime();
+  let nearest = allDates[0];
+  let bestDiff = Infinity;
+  for (const d of allDates) {
+    const diff = Math.abs(new Date(d).getTime() - target);
+    if (diff < bestDiff) { bestDiff = diff; nearest = d; }
+  }
+  return amount * dates[nearest];
+}
+
+function isoDate(ts) {
+  if (!ts) return '';
+  const d = new Date(ts);
+  return d.getFullYear() + '-' +
+         String(d.getMonth() + 1).padStart(2, '0') + '-' +
+         String(d.getDate()).padStart(2, '0');
+}
+
 function toast(msg) {
   const t = $('#toast');
   t.textContent = msg;
@@ -669,6 +823,12 @@ function fmtNum(n, decimals = 2) {
   if (Math.abs(n) >= 1) return n.toFixed(decimals);
   if (Math.abs(n) >= 0.0001) return n.toFixed(6);
   return n.toExponential(2);
+}
+
+function fmtUSDValue(n) {
+  if (n == null) return '—';
+  if (Math.abs(n) < 0.01) return '$' + n.toFixed(4);
+  return '$' + n.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 }
 
 function fmtDate(ts) {
@@ -686,9 +846,26 @@ function switchTab(name) {
   $$('.panel-view').forEach(v => v.classList.toggle('active', v.id === 'view-' + name));
   if (name === 'overview') renderOverview();
   if (name === 'wins') renderWins();
-  if (name === 'settings') renderStorageInfo();
+  if (name === 'settings') { renderStorageInfo(); renderPriceCacheInfo(); }
 }
 $$('nav.tabs button').forEach(b => b.addEventListener('click', () => switchTab(b.dataset.tab)));
+
+// View mode toggle (Native ↔ USD)
+function applyViewMode() {
+  $$('#currency-toggle .toggle-opt').forEach(b =>
+    b.classList.toggle('active', b.dataset.mode === viewMode));
+  // Re-render whichever view is active
+  const active = $$('.panel-view.active')[0];
+  if (active?.id === 'view-overview') renderOverview();
+  else if (active?.id === 'view-wins') renderWins();
+}
+$$('#currency-toggle .toggle-opt').forEach(b => {
+  b.addEventListener('click', () => {
+    viewMode = b.dataset.mode;
+    localStorage.setItem('sw-view-mode', viewMode);
+    applyViewMode();
+  });
+});
 
 /* ==============================================================
    RENDER: HEADER STATS
@@ -698,6 +875,8 @@ async function renderHeaderStats() {
   $('#stat-total').textContent = all.length.toLocaleString();
   const games = new Set(all.map(b => b.gameName));
   $('#stat-games').textContent = games.size;
+  // Biggest multi is based on actually-profitable bets to filter
+  // out trivial "win" payouts like 0.5x plinko
   const wins = all.filter(b => b.won);
   if (wins.length) {
     const top = wins.reduce((a, b) => a.payoutMultiplier > b.payoutMultiplier ? a : b);
@@ -737,22 +916,50 @@ async function renderOverview() {
     .sort((a, b) => b[1].length - a[1].length)
     .map(([game, bets]) => {
       const wins = bets.filter(b => b.won);
-      const topMulti = wins.length ? Math.max(...wins.map(b => b.payoutMultiplier)) : 0;
+      const topWin = wins.length
+        ? wins.reduce((a, b) => a.payoutMultiplier > b.payoutMultiplier ? a : b)
+        : null;
+      const topMulti = topWin ? topWin.payoutMultiplier : 0;
+      const topWinDate = topWin ? fmtDate(topWin.createdAt) : '—';
+      // Date range for this game
+      const ts = bets.map(b => b.createdAt).filter(Boolean).sort();
+      const firstPlayed = ts.length ? fmtDate(ts[0]) : '—';
+      const lastPlayed = ts.length ? fmtDate(ts[ts.length-1]) : '—';
       // Most-used currency for this game
       const curCounts = {};
       bets.forEach(b => { curCounts[b.currency] = (curCounts[b.currency] || 0) + 1; });
       const topCur = Object.entries(curCounts).sort((a, b) => b[1] - a[1])[0]?.[0] || '';
-      const inCur = bets.filter(b => b.currency === topCur);
-      const wagered = inCur.reduce((s, b) => s + b.amount, 0);
-      const won = inCur.reduce((s, b) => s + b.payout, 0);
-      const net = won - wagered;
+      let netLabel, netValue, netColor;
+      if (viewMode === 'usd') {
+        // Sum USD across all currencies
+        let totalProfitUSD = 0;
+        let hasMissing = false;
+        for (const b of bets) {
+          const usd = toUSD(b.profit, b.currency, b.createdAt);
+          if (usd == null) { hasMissing = true; } else { totalProfitUSD += usd; }
+        }
+        netLabel = 'Net ($)';
+        netValue = hasMissing && totalProfitUSD === 0 ? 'no prices' : fmtUSDValue(totalProfitUSD);
+        netColor = totalProfitUSD >= 0 ? 'var(--accent)' : 'var(--danger)';
+      } else {
+        // Native: sum profit in the dominant currency only
+        const inCur = bets.filter(b => b.currency === topCur);
+        const net = inCur.reduce((s, b) => s + b.profit, 0);
+        netLabel = `Net (${topCur.toUpperCase()})`;
+        netValue = (net >= 0 ? '+' : '') + fmtNum(net, 4);
+        netColor = net >= 0 ? 'var(--accent)' : 'var(--danger)';
+      }
       return `<div class="game-card" data-game="${game}">
         <h3>${game.replace(/-/g, ' ')}</h3>
         <div class="game-card-stats">
           <div class="game-card-stat"><span class="label">Bets</span><span class="value">${bets.length.toLocaleString()}</span></div>
           <div class="game-card-stat"><span class="label">Wins</span><span class="value">${wins.length.toLocaleString()}</span></div>
           <div class="game-card-stat"><span class="label">Top Multi</span><span class="value green">${topMulti ? topMulti.toFixed(2) + '×' : '—'}</span></div>
-          <div class="game-card-stat"><span class="label">Net (${topCur.toUpperCase()})</span><span class="value" style="color:${net >= 0 ? 'var(--accent)' : 'var(--danger)'}">${net >= 0 ? '+' : ''}${fmtNum(net, 4)}</span></div>
+          <div class="game-card-stat"><span class="label">${netLabel}</span><span class="value" style="color:${netColor}">${netValue}</span></div>
+        </div>
+        <div class="game-card-dates">
+          <span class="date-item"><span class="date-label">Top win</span> ${topWinDate}</span>
+          <span class="date-item"><span class="date-label">Played</span> ${firstPlayed} – ${lastPlayed}</span>
         </div>
       </div>`;
     }).join('');
@@ -785,10 +992,24 @@ async function renderWins() {
   let bets = all.filter(b => b.won);
   if (gameFilter) bets = bets.filter(b => b.gameName === gameFilter);
 
+  // In USD mode, augment with computed USD fields
+  if (viewMode === 'usd') {
+    bets = bets.map(b => ({
+      ...b,
+      amountUSD: toUSD(b.amount, b.currency, b.createdAt),
+      payoutUSD: toUSD(b.payout, b.currency, b.createdAt),
+      profitUSD: toUSD(b.profit, b.currency, b.createdAt),
+    }));
+  }
+
   const sorters = {
     multi:  (a, b) => b.payoutMultiplier - a.payoutMultiplier,
-    payout: (a, b) => b.payout - a.payout,
-    profit: (a, b) => b.profit - a.profit,
+    payout: (a, b) => viewMode === 'usd'
+      ? (b.payoutUSD ?? -Infinity) - (a.payoutUSD ?? -Infinity)
+      : b.payout - a.payout,
+    profit: (a, b) => viewMode === 'usd'
+      ? (b.profitUSD ?? -Infinity) - (a.profitUSD ?? -Infinity)
+      : b.profit - a.profit,
   };
   bets.sort(sorters[sortBy] || sorters.multi);
   if (limit !== 'all') bets = bets.slice(0, parseInt(limit, 10));
@@ -799,25 +1020,42 @@ async function renderWins() {
     return;
   }
 
+  const isUSD = viewMode === 'usd';
+  const hdrAmt = isUSD ? 'Bet ($)' : 'Bet';
+  const hdrPayout = isUSD ? 'Payout ($)' : 'Payout';
+  const hdrProfit = isUSD ? 'Profit ($)' : 'Profit';
+
   c.innerHTML = `<div class="table-wrap"><table>
     <thead><tr>
       <th>#</th><th>Game</th>
       <th class="num">Multi</th>
-      <th class="num">Bet</th>
-      <th class="num">Payout</th>
-      <th class="num">Profit</th>
+      <th class="num">${hdrAmt}</th>
+      <th class="num">${hdrPayout}</th>
+      <th class="num">${hdrProfit}</th>
       <th class="num">Date</th>
     </tr></thead>
     <tbody>
-      ${bets.map((b, i) => `<tr>
-        <td><span class="rank">#${i+1}</span></td>
-        <td><span class="game-tag">${b.gameName}</span></td>
-        <td class="num"><span class="mult ${b.payoutMultiplier >= 100 ? 'big' : ''}">${b.payoutMultiplier.toFixed(2)}×</span></td>
-        <td class="num">${fmtNum(b.amount)}<span class="currency">${b.currency}</span></td>
-        <td class="num">${fmtNum(b.payout)}<span class="currency">${b.currency}</span></td>
-        <td class="num" style="color:${b.profit > 0 ? 'var(--accent)' : 'var(--text-dim)'}">${b.profit > 0 ? '+' : ''}${fmtNum(b.profit)}</td>
-        <td class="num" style="color:var(--text-dim)">${fmtDate(b.createdAt)}</td>
-      </tr>`).join('')}
+      ${bets.map((b, i) => {
+        const profitColor = (isUSD ? b.profitUSD : b.profit) > 0 ? 'var(--accent)' : 'var(--text-dim)';
+        const fmtAmt = isUSD
+          ? (b.amountUSD != null ? fmtUSDValue(b.amountUSD) : '<span class="no-price">no price</span>')
+          : `${fmtNum(b.amount)}<span class="currency">${b.currency}</span>`;
+        const fmtPay = isUSD
+          ? (b.payoutUSD != null ? fmtUSDValue(b.payoutUSD) : '<span class="no-price">no price</span>')
+          : `${fmtNum(b.payout)}<span class="currency">${b.currency}</span>`;
+        const fmtPro = isUSD
+          ? (b.profitUSD != null ? (b.profitUSD > 0 ? '+' : '') + fmtUSDValue(b.profitUSD) : '—')
+          : `${b.profit > 0 ? '+' : ''}${fmtNum(b.profit)}`;
+        return `<tr>
+          <td><span class="rank">#${i+1}</span></td>
+          <td><span class="game-tag">${b.gameName}</span></td>
+          <td class="num"><span class="mult ${b.payoutMultiplier >= 100 ? 'big' : ''}">${b.payoutMultiplier.toFixed(2)}×</span></td>
+          <td class="num">${fmtAmt}</td>
+          <td class="num">${fmtPay}</td>
+          <td class="num" style="color:${profitColor}">${fmtPro}</td>
+          <td class="num" style="color:var(--text-dim)">${fmtDate(b.createdAt)}</td>
+        </tr>`;
+      }).join('')}
     </tbody>
   </table></div>`;
 }
@@ -938,6 +1176,68 @@ async function renderStorageInfo() {
   $('#storage-info').textContent = `${n.toLocaleString()} bets stored${extra}`;
 }
 
+async function renderPriceCacheInfo() {
+  const rows = await getAllPrices();
+  if (!rows.length) {
+    $('#price-cache-info').textContent = 'No price data yet. Click "Fetch Prices" to download.';
+    return;
+  }
+  const summary = rows.map(r => {
+    const days = Object.keys(r.dates).length;
+    return `${r.currency.toUpperCase()}: ${days}d`;
+  }).join(' · ');
+  const latest = Math.max(...rows.map(r => r.updatedAt || 0));
+  $('#price-cache-info').textContent = `${summary} · last updated ${fmtDate(latest)}`;
+}
+
+/* ==============================================================
+   PRICE FETCHING
+   Uses CoinGecko's free market_chart endpoint (no API key required,
+   ~30 calls/min limit). Fetches 365 days of daily prices per coin.
+   ============================================================== */
+async function fetchPricesForCurrency(cur, coinId) {
+  const url = `https://api.coingecko.com/api/v3/coins/${coinId}/market_chart?vs_currency=usd&days=365&interval=daily`;
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`${cur}: HTTP ${res.status}`);
+  const data = await res.json();
+  if (!data.prices || !Array.isArray(data.prices)) throw new Error(`${cur}: malformed response`);
+  const dates = {};
+  for (const [ts, price] of data.prices) {
+    const key = isoDate(ts);
+    dates[key] = price;
+  }
+  await savePrices(cur, dates);
+  return Object.keys(dates).length;
+}
+
+async function fetchAllPrices() {
+  const btn = $('#btn-fetch-prices');
+  btn.disabled = true;
+  btn.textContent = 'Fetching…';
+  const entries = Object.entries(SUPPORTED_CURRENCIES);
+  let succeeded = 0, failed = 0;
+  for (let i = 0; i < entries.length; i++) {
+    const [cur, coinId] = entries[i];
+    btn.textContent = `Fetching ${cur.toUpperCase()} (${i+1}/${entries.length})…`;
+    try {
+      await fetchPricesForCurrency(cur, coinId);
+      succeeded++;
+    } catch (e) {
+      console.error(e);
+      failed++;
+    }
+    // CoinGecko free tier: ~30 req/min, so we space out a bit
+    if (i < entries.length - 1) await new Promise(r => setTimeout(r, 2500));
+  }
+  await loadPriceCache();
+  btn.disabled = false;
+  btn.textContent = 'Fetch Prices';
+  toast(`Prices: ${succeeded} ok, ${failed} failed`);
+  renderPriceCacheInfo();
+  applyViewMode();
+}
+$('#btn-fetch-prices').addEventListener('click', fetchAllPrices);
+
 /* ==============================================================
    USERSCRIPT BRIDGE
    Listens for postMessage queries from the Tampermonkey script
@@ -959,7 +1259,15 @@ window.addEventListener('message', async (event) => {
       const wins = bets.filter(b => b.won)
         .sort((a, b) => b.payoutMultiplier - a.payoutMultiplier)
         .slice(0, msg.limit || 50);
-      reply({ ok: true, wins });
+      // Attach computed USD fields so the userscript modal can show them
+      // without needing its own price cache or conversion logic.
+      const enriched = wins.map(b => ({
+        ...b,
+        amountUSD: toUSD(b.amount, b.currency, b.createdAt),
+        payoutUSD: toUSD(b.payout, b.currency, b.createdAt),
+        profitUSD: toUSD(b.profit, b.currency, b.createdAt),
+      }));
+      reply({ ok: true, wins: enriched, viewMode });
     } else if (msg.type === 'gameStats') {
       const bets = await getBetsByGame(msg.gameName);
       reply({ ok: true, totalBets: bets.length, totalWins: bets.filter(b => b.won).length });
@@ -982,6 +1290,8 @@ window.addEventListener('message', async (event) => {
    INIT
    ============================================================== */
 (async function init() {
+  await loadPriceCache();
+  applyViewMode(); // sets the toggle visually
   await renderHeaderStats();
   renderOverview();
 })();
