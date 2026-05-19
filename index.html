@@ -660,12 +660,23 @@
    - topWins      : per-game top 100 wins by multiplier
    ============================================================== */
 const DB_NAME = 'stake-wins';
-const DB_VERSION = 3;
+const DB_VERSION = 4;
 const STORE = 'bets';
 const PRICES_STORE = 'prices';
 const STATS_STORE = 'gameStats';
 const TOPWINS_STORE = 'topWins';
+const LEADERBOARDS_STORE = 'leaderboards';
 const TOPWINS_PER_GAME = 100;
+const LEADERBOARD_SIZE = 50;
+
+// Leaderboard categories. Each maps to a sort key function and a filter.
+const LEADERBOARDS = {
+  multi:         { label: 'Top Biggest Multipliers',   field: 'payoutMultiplier', order: 'desc' },
+  payoutUSD:     { label: 'Top Biggest Payouts',       field: 'payoutUSD',        order: 'desc' },
+  betUSD:        { label: 'Top Biggest Bets',          field: 'amountUSD',        order: 'desc' },
+  recentWins:    { label: 'Most Recent Wins',          field: 'createdAt',        order: 'desc', filter: 'wins' },
+  recentLosses:  { label: 'Most Recent Losses',        field: 'createdAt',        order: 'desc', filter: 'losses' },
+};
 
 function openDB() {
   return new Promise((resolve, reject) => {
@@ -685,9 +696,13 @@ function openDB() {
         db.createObjectStore(STATS_STORE, { keyPath: 'gameName' });
       }
       if (!db.objectStoreNames.contains(TOPWINS_STORE)) {
-        // composite key: gameName + bet id
         const s = db.createObjectStore(TOPWINS_STORE, { keyPath: ['gameName', 'id'] });
         s.createIndex('gameName', 'gameName', { unique: false });
+      }
+      if (!db.objectStoreNames.contains(LEADERBOARDS_STORE)) {
+        // Key shape: { gameName: '<game>' | '__all__', category: '<cat>' }
+        // Value: { gameName, category, entries: [bet, bet, ...], updatedAt }
+        db.createObjectStore(LEADERBOARDS_STORE, { keyPath: ['gameName', 'category'] });
       }
     };
     req.onsuccess = () => resolve(req.result);
@@ -843,10 +858,11 @@ async function getBetsByGame(gameName) {
 async function clearAll() {
   const db = await openDB();
   return new Promise((resolve, reject) => {
-    const tx = db.transaction([STORE, STATS_STORE, TOPWINS_STORE], 'readwrite');
+    const tx = db.transaction([STORE, STATS_STORE, TOPWINS_STORE, LEADERBOARDS_STORE], 'readwrite');
     tx.objectStore(STORE).clear();
     tx.objectStore(STATS_STORE).clear();
     tx.objectStore(TOPWINS_STORE).clear();
+    tx.objectStore(LEADERBOARDS_STORE).clear();
     tx.oncomplete = () => resolve();
     tx.onerror = () => reject(tx.error);
   });
@@ -960,6 +976,179 @@ function amountToUSD(amount, currency, timestamp, cache) {
     if (diff < bestDiff) { bestDiff = diff; nearest = d; }
   }
   return amount * dates[nearest];
+}
+
+/* ==============================================================
+   LEADERBOARDS
+   Precomputed top-N lists per game (and "__all__") per category.
+   Rebuilt during the auto-backfill and on-demand via Settings.
+   Currently NOT updated incrementally on ingest — rebuild after
+   importing new data, or rely on the auto-backfill to refresh.
+   ============================================================== */
+async function getLeaderboard(gameName, category) {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const req = db.transaction(LEADERBOARDS_STORE, 'readonly')
+      .objectStore(LEADERBOARDS_STORE).get([gameName, category]);
+    req.onsuccess = () => resolve(req.result?.entries || []);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+async function buildLeaderboardsForGame(gameName, prices, progressCb) {
+  // Pull all bets for this game (or all bets globally for __all__)
+  const db = await openDB();
+  const bets = await new Promise((resolve, reject) => {
+    if (gameName === '__all__') {
+      const req = db.transaction(STORE, 'readonly').objectStore(STORE).getAll();
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    } else {
+      const idx = db.transaction(STORE, 'readonly').objectStore(STORE).index('gameName');
+      const req = idx.getAll(gameName);
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    }
+  });
+  if (progressCb) progressCb(`${gameName}: enriching ${bets.length.toLocaleString()} bets`);
+  // Enrich with USD fields once so we don't recompute per sort
+  for (const b of bets) {
+    b.amountUSD = amountToUSD(b.amount, b.currency, b.createdAt, prices);
+    b.payoutUSD = amountToUSD(b.payout, b.currency, b.createdAt, prices);
+    b.profit = b.payout - b.amount;
+    b.won = b.payout > b.amount;
+  }
+
+  // For each category, compute the top N
+  const results = {};
+  for (const [cat, def] of Object.entries(LEADERBOARDS)) {
+    let candidates = bets;
+    if (def.filter === 'wins') candidates = bets.filter(b => b.won);
+    else if (def.filter === 'losses') candidates = bets.filter(b => b.payout < b.amount);
+    const getter = (b) => b[def.field] ?? -Infinity;
+    const sorted = candidates.slice().sort((a, b) =>
+      def.order === 'desc' ? getter(b) - getter(a) : getter(a) - getter(b));
+    // Slim each entry: only keep the fields the modal renders
+    const slim = sorted.slice(0, LEADERBOARD_SIZE).map(b => ({
+      id: b.id,
+      gameName: b.gameName,
+      amount: b.amount,
+      payout: b.payout,
+      profit: b.profit,
+      payoutMultiplier: b.payoutMultiplier,
+      currency: b.currency,
+      createdAt: b.createdAt,
+      amountUSD: b.amountUSD,
+      payoutUSD: b.payoutUSD,
+    }));
+    results[cat] = slim;
+  }
+
+  // Write all categories in a single transaction
+  await new Promise((resolve, reject) => {
+    const tx = db.transaction(LEADERBOARDS_STORE, 'readwrite');
+    const store = tx.objectStore(LEADERBOARDS_STORE);
+    const now = Date.now();
+    for (const [cat, entries] of Object.entries(results)) {
+      store.put({ gameName, category: cat, entries, updatedAt: now });
+    }
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+async function buildAllLeaderboards(progressCb) {
+  // Ensure prices are loaded
+  if (Object.keys(priceCache).length === 0) await loadPriceCache();
+  // Build the __all__ first (uses global scan), then per-game
+  if (progressCb) progressCb('Building global leaderboards…');
+  await buildLeaderboardsForGame('__all__', priceCache, progressCb);
+  const stats = await getAllGameStats();
+  for (let i = 0; i < stats.length; i++) {
+    const g = stats[i];
+    if (progressCb) progressCb(`Building leaderboards for ${g.gameName} (${i+1}/${stats.length})`);
+    await buildLeaderboardsForGame(g.gameName, priceCache, progressCb);
+    // Yield to keep UI responsive
+    if (i % 5 === 0) await new Promise(r => setTimeout(r, 0));
+  }
+  if (progressCb) progressCb('Done.');
+}
+
+/* ==============================================================
+   PNL SUMMARY
+   Rolling-window net profit/loss across the bets store.
+   Not precomputed — runs on demand. Cached for 5 minutes per
+   (gameName, viewMode) tuple.
+   ============================================================== */
+const PNL_WINDOWS = [7, 14, 30, 60, 90, 120, 150, 180, 210, 240, 270, 300, 330, 360, 400];
+const pnlCache = new Map(); // key -> { ts, data }
+
+async function getPNL(gameName, mode) {
+  // mode: 'native' or 'usd'
+  const key = `${gameName}::${mode}`;
+  const cached = pnlCache.get(key);
+  if (cached && Date.now() - cached.ts < 5 * 60 * 1000) return cached.data;
+
+  if (mode === 'usd' && Object.keys(priceCache).length === 0) {
+    await loadPriceCache();
+  }
+
+  const db = await openDB();
+  const bets = await new Promise((resolve, reject) => {
+    if (gameName === '__all__') {
+      const req = db.transaction(STORE, 'readonly').objectStore(STORE).getAll();
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    } else {
+      const idx = db.transaction(STORE, 'readonly').objectStore(STORE).index('gameName');
+      const req = idx.getAll(gameName);
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    }
+  });
+
+  const now = Date.now();
+  const windows = PNL_WINDOWS.map(days => ({
+    label: `${days}d`,
+    days,
+    cutoff: now - days * 86400 * 1000,
+    wagered: 0, won: 0, count: 0,
+  }));
+  const allTime = { label: 'All time', days: null, cutoff: 0, wagered: 0, won: 0, count: 0 };
+
+  for (const b of bets) {
+    let wager = b.amount;
+    let payout = b.payout;
+    if (mode === 'usd') {
+      const wUSD = amountToUSD(wager, b.currency, b.createdAt, priceCache);
+      const pUSD = amountToUSD(payout, b.currency, b.createdAt, priceCache);
+      if (wUSD == null || pUSD == null) continue;
+      wager = wUSD;
+      payout = pUSD;
+    }
+    // All time bucket
+    allTime.wagered += wager;
+    allTime.won += payout;
+    allTime.count += 1;
+    // Rolling windows
+    for (const w of windows) {
+      if (b.createdAt >= w.cutoff) {
+        w.wagered += wager;
+        w.won += payout;
+        w.count += 1;
+      }
+    }
+  }
+
+  const result = [...windows, allTime].map(w => ({
+    label: w.label,
+    wagered: w.wagered,
+    won: w.won,
+    net: w.won - w.wagered,
+    count: w.count,
+  }));
+  pnlCache.set(key, { ts: Date.now(), data: result });
+  return result;
 }
 
 /* ---- Backfill: rebuild aggregates from existing raw bets ----
@@ -1640,10 +1829,12 @@ $('#btn-rebuild').addEventListener('click', async () => {
   try {
     const processed = await backfillAggregates((n, done) => {
       status.textContent = done
-        ? `Done. ${n.toLocaleString()} bets processed.`
-        : `Processing ${n.toLocaleString()} bets…`;
+        ? `Stats done. Building leaderboards…`
+        : `Stats: ${n.toLocaleString()} bets…`;
     });
-    toast(`Rebuilt aggregates from ${processed.toLocaleString()} bets`);
+    await buildAllLeaderboards((msg) => { status.textContent = msg; });
+    status.textContent = `Done. ${processed.toLocaleString()} bets processed.`;
+    toast(`Rebuilt aggregates and leaderboards`);
     await renderHeaderStats();
     if ($('#view-overview').classList.contains('active')) renderOverview();
     if ($('#view-wins').classList.contains('active')) renderWins();
@@ -1663,7 +1854,6 @@ async function maybeAutoBackfill() {
   const stats = await getAllGameStats();
   const betCount = await countBets();
   if (betCount > 0 && stats.length === 0) {
-    // Show a banner so the user knows what's happening
     const banner = document.createElement('div');
     banner.id = 'auto-backfill-banner';
     banner.innerHTML = `<div>Upgrading database — rebuilding stats from ${betCount.toLocaleString()} bets. This is a one-time process. <span id="bf-progress">starting…</span></div>`;
@@ -1671,11 +1861,38 @@ async function maybeAutoBackfill() {
     try {
       await backfillAggregates((n, done) => {
         const p = document.getElementById('bf-progress');
-        if (p) p.textContent = done ? `done` : `${n.toLocaleString()} / ${betCount.toLocaleString()}`;
+        if (p) p.textContent = done ? `stats done, building leaderboards…` : `${n.toLocaleString()} / ${betCount.toLocaleString()}`;
+      });
+      await buildAllLeaderboards((msg) => {
+        const p = document.getElementById('bf-progress');
+        if (p) p.textContent = msg;
       });
       banner.querySelector('div').innerHTML = '✓ Upgrade complete. <button onclick="this.parentElement.parentElement.remove(); location.reload()">Refresh</button>';
     } catch (e) {
       banner.querySelector('div').innerHTML = 'Upgrade failed: ' + e.message;
+    }
+  } else if (betCount > 0) {
+    // Check if leaderboards exist; if not, build them silently
+    const db = await openDB();
+    const lbCount = await new Promise((resolve) => {
+      const req = db.transaction(LEADERBOARDS_STORE, 'readonly').objectStore(LEADERBOARDS_STORE).count();
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => resolve(0);
+    });
+    if (lbCount === 0) {
+      const banner = document.createElement('div');
+      banner.id = 'auto-backfill-banner';
+      banner.innerHTML = `<div>Building leaderboards from your archive… <span id="bf-progress">starting…</span></div>`;
+      document.body.appendChild(banner);
+      try {
+        await buildAllLeaderboards((msg) => {
+          const p = document.getElementById('bf-progress');
+          if (p) p.textContent = msg;
+        });
+        banner.querySelector('div').innerHTML = '✓ Leaderboards built. <button onclick="this.parentElement.parentElement.remove()">Close</button>';
+      } catch (e) {
+        banner.querySelector('div').innerHTML = 'Leaderboard build failed: ' + e.message;
+      }
     }
   }
 }
@@ -1696,6 +1913,13 @@ window.addEventListener('message', async (event) => {
   try {
     if (msg.type === 'ping') {
       reply({ ok: true });
+    } else if (msg.type === 'getLeaderboard') {
+      if (Object.keys(priceCache).length === 0) await loadPriceCache();
+      const entries = await getLeaderboard(msg.gameName, msg.category);
+      reply({ ok: true, entries, viewMode });
+    } else if (msg.type === 'getPNL') {
+      const data = await getPNL(msg.gameName, msg.mode || viewMode);
+      reply({ ok: true, data, viewMode });
     } else if (msg.type === 'topWinsForGame') {
       if (Object.keys(priceCache).length === 0) {
         await loadPriceCache();
