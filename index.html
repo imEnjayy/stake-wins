@@ -437,6 +437,27 @@
   }
 
   /* ---- Toast ---- */
+  #auto-backfill-banner {
+    position: fixed;
+    top: 0; left: 0; right: 0;
+    background: var(--accent);
+    color: #0d1922;
+    padding: 14px 24px;
+    text-align: center;
+    font-weight: 700;
+    z-index: 1001;
+    box-shadow: 0 4px 12px rgba(0,0,0,.3);
+  }
+  #auto-backfill-banner button {
+    background: #0d1922;
+    color: #00e701;
+    border: none;
+    padding: 4px 10px;
+    border-radius: 4px;
+    margin-left: 12px;
+    cursor: pointer;
+    font-weight: 700;
+  }
   .toast {
     position: fixed;
     bottom: 24px;
@@ -555,6 +576,14 @@
   <section class="panel-view" id="view-settings">
     <div class="settings-row">
       <div class="info">
+        <h3>Rebuild aggregates</h3>
+        <p>Recompute game statistics and top-win lists from your stored bets. Run this once after upgrading from an older dashboard version, or any time stats look wrong.</p>
+        <p id="rebuild-status" style="margin-top:6px;font-family:var(--mono);font-size:11px;color:var(--text-fade)"></p>
+      </div>
+      <button class="btn secondary" id="btn-rebuild">Rebuild</button>
+    </div>
+    <div class="settings-row">
+      <div class="info">
         <h3>Fetch USD price history</h3>
         <p>Downloads daily USD prices for LTC, BTC, ETH, SOL, XRP, USDT, USDC from CoinGecko's free API. Required for the USD view mode. Re-run weekly to refresh recent prices.</p>
       </div>
@@ -605,11 +634,20 @@
 
 /* ==============================================================
    DATABASE LAYER (IndexedDB)
+   v3: adds precomputed aggregate stores so the UI doesn't re-scan
+   millions of bets on every render.
+   - bets         : raw bet records (keyed by Stake bet UUID)
+   - prices       : per-currency daily USD prices
+   - gameStats    : 1 row per game with totals/aggregates
+   - topWins      : per-game top 100 wins by multiplier
    ============================================================== */
 const DB_NAME = 'stake-wins';
-const DB_VERSION = 2;
+const DB_VERSION = 3;
 const STORE = 'bets';
-const PRICES_STORE = 'prices'; // { currency: 'ltc', dates: { 'YYYY-MM-DD': price } }
+const PRICES_STORE = 'prices';
+const STATS_STORE = 'gameStats';
+const TOPWINS_STORE = 'topWins';
+const TOPWINS_PER_GAME = 100;
 
 function openDB() {
   return new Promise((resolve, reject) => {
@@ -625,29 +663,137 @@ function openDB() {
       if (!db.objectStoreNames.contains(PRICES_STORE)) {
         db.createObjectStore(PRICES_STORE, { keyPath: 'currency' });
       }
+      if (!db.objectStoreNames.contains(STATS_STORE)) {
+        db.createObjectStore(STATS_STORE, { keyPath: 'gameName' });
+      }
+      if (!db.objectStoreNames.contains(TOPWINS_STORE)) {
+        // composite key: gameName + bet id
+        const s = db.createObjectStore(TOPWINS_STORE, { keyPath: ['gameName', 'id'] });
+        s.createIndex('gameName', 'gameName', { unique: false });
+      }
     };
     req.onsuccess = () => resolve(req.result);
     req.onerror = () => reject(req.error);
   });
 }
 
+/* ---- Raw bet store (legacy reads, kept for export/import) ---- */
 async function bulkPut(records) {
+  // For each record: insert if not already present, and update the aggregate
+  // stores at the same time. Returns { inserted, skipped }.
   const db = await openDB();
   return new Promise((resolve, reject) => {
-    const tx = db.transaction(STORE, 'readwrite');
-    const store = tx.objectStore(STORE);
+    const tx = db.transaction([STORE, STATS_STORE, TOPWINS_STORE], 'readwrite');
+    const betsStore = tx.objectStore(STORE);
+    const statsStore = tx.objectStore(STATS_STORE);
+    const topStore = tx.objectStore(TOPWINS_STORE);
+
     let inserted = 0, skipped = 0;
     let pending = records.length;
     if (!pending) return resolve({ inserted, skipped });
-    for (const r of records) {
-      const getReq = store.get(r.id);
-      getReq.onsuccess = () => {
-        if (getReq.result) { skipped++; }
-        else { store.add(r); inserted++; }
-        if (--pending === 0) resolve({ inserted, skipped });
+
+    // Batch fresh stats in memory; we'll flush at the end
+    const statsDelta = new Map(); // gameName -> stats object loaded from DB
+
+    function loadOrInitStats(game, cb) {
+      if (statsDelta.has(game)) return cb(statsDelta.get(game));
+      const r = statsStore.get(game);
+      r.onsuccess = () => {
+        const s = r.result || {
+          gameName: game,
+          totalBets: 0,
+          totalWins: 0,
+          topMulti: 0,
+          topWinId: null,
+          firstBet: Infinity,
+          lastBet: 0,
+          currencyCounts: {},
+          netByCurrency: {},
+        };
+        statsDelta.set(game, s);
+        cb(s);
       };
-      getReq.onerror = () => { if (--pending === 0) resolve({ inserted, skipped }); };
+      r.onerror = () => cb(null);
     }
+
+    function flushStats() {
+      for (const s of statsDelta.values()) statsStore.put(s);
+    }
+
+    function maybeUpdateTopWins(rec, statsForGame) {
+      // Only profitable wins are tracked
+      if (!rec.won) return;
+      // Cheap check: is this multi big enough to even consider?
+      // We'll prune later. Always insert; we trim periodically.
+      topStore.put({
+        gameName: rec.gameName,
+        id: rec.id,
+        payoutMultiplier: rec.payoutMultiplier,
+        amount: rec.amount,
+        payout: rec.payout,
+        profit: rec.profit,
+        currency: rec.currency,
+        createdAt: rec.createdAt,
+      });
+    }
+
+    function processOne(r) {
+      const getReq = betsStore.get(r.id);
+      getReq.onsuccess = () => {
+        if (getReq.result) {
+          skipped++;
+          if (--pending === 0) { flushStats(); }
+        } else {
+          betsStore.add(r);
+          inserted++;
+          loadOrInitStats(r.gameName, (s) => {
+            if (s) {
+              s.totalBets++;
+              if (r.won) s.totalWins++;
+              if (r.payoutMultiplier > s.topMulti) {
+                s.topMulti = r.payoutMultiplier;
+                s.topWinId = r.id;
+              }
+              if (r.createdAt && r.createdAt < s.firstBet) s.firstBet = r.createdAt;
+              if (r.createdAt && r.createdAt > s.lastBet) s.lastBet = r.createdAt;
+              s.currencyCounts[r.currency] = (s.currencyCounts[r.currency] || 0) + 1;
+              s.netByCurrency[r.currency] = (s.netByCurrency[r.currency] || 0) + r.profit;
+              maybeUpdateTopWins(r, s);
+            }
+            if (--pending === 0) { flushStats(); }
+          });
+        }
+      };
+      getReq.onerror = () => {
+        if (--pending === 0) { flushStats(); }
+      };
+    }
+
+    for (const r of records) processOne(r);
+
+    tx.oncomplete = async () => {
+      // Trim top wins down to TOPWINS_PER_GAME per game (only games we touched)
+      const touchedGames = [...statsDelta.keys()];
+      for (const g of touchedGames) await trimTopWins(g);
+      resolve({ inserted, skipped });
+    };
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+async function trimTopWins(gameName) {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(TOPWINS_STORE, 'readwrite');
+    const store = tx.objectStore(TOPWINS_STORE);
+    const idx = store.index('gameName');
+    const req = idx.getAll(gameName);
+    req.onsuccess = () => {
+      const wins = req.result.sort((a, b) => b.payoutMultiplier - a.payoutMultiplier);
+      const toDelete = wins.slice(TOPWINS_PER_GAME);
+      for (const w of toDelete) store.delete([w.gameName, w.id]);
+    };
+    tx.oncomplete = () => resolve();
     tx.onerror = () => reject(tx.error);
   });
 }
@@ -662,11 +808,16 @@ async function getAllBets() {
 }
 
 async function getBetsByGame(gameName) {
+  // Used by the userscript "topWinsForGame" bridge — return precomputed top wins
   const db = await openDB();
   return new Promise((resolve, reject) => {
-    const idx = db.transaction(STORE, 'readonly').objectStore(STORE).index('gameName');
+    const idx = db.transaction(TOPWINS_STORE, 'readonly').objectStore(TOPWINS_STORE).index('gameName');
     const req = idx.getAll(gameName);
-    req.onsuccess = () => resolve(req.result);
+    req.onsuccess = () => {
+      // Top wins store rows have the shape we need; flag them all as won:true
+      // and add a gameName field so the userscript renderer works unchanged.
+      resolve(req.result.map(w => ({ ...w, won: true })));
+    };
     req.onerror = () => reject(req.error);
   });
 }
@@ -674,9 +825,12 @@ async function getBetsByGame(gameName) {
 async function clearAll() {
   const db = await openDB();
   return new Promise((resolve, reject) => {
-    const req = db.transaction(STORE, 'readwrite').objectStore(STORE).clear();
-    req.onsuccess = () => resolve();
-    req.onerror = () => reject(req.error);
+    const tx = db.transaction([STORE, STATS_STORE, TOPWINS_STORE], 'readwrite');
+    tx.objectStore(STORE).clear();
+    tx.objectStore(STATS_STORE).clear();
+    tx.objectStore(TOPWINS_STORE).clear();
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
   });
 }
 
@@ -686,6 +840,114 @@ async function countBets() {
     const req = db.transaction(STORE, 'readonly').objectStore(STORE).count();
     req.onsuccess = () => resolve(req.result);
     req.onerror = () => reject(req.error);
+  });
+}
+
+async function getAllGameStats() {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const req = db.transaction(STATS_STORE, 'readonly').objectStore(STATS_STORE).getAll();
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+async function getTopWinsAllGames(limit) {
+  // Returns up to `limit` top wins across ALL games, sorted by multi
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const req = db.transaction(TOPWINS_STORE, 'readonly').objectStore(TOPWINS_STORE).getAll();
+    req.onsuccess = () => {
+      const all = req.result.sort((a, b) => b.payoutMultiplier - a.payoutMultiplier);
+      resolve(limit ? all.slice(0, limit) : all);
+    };
+    req.onerror = () => reject(req.error);
+  });
+}
+
+async function getTopWinsForGame(gameName) {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const idx = db.transaction(TOPWINS_STORE, 'readonly').objectStore(TOPWINS_STORE).index('gameName');
+    const req = idx.getAll(gameName);
+    req.onsuccess = () => resolve(req.result.sort((a, b) => b.payoutMultiplier - a.payoutMultiplier));
+    req.onerror = () => reject(req.error);
+  });
+}
+
+/* ---- Backfill: rebuild aggregates from existing raw bets ----
+   For users upgrading from earlier versions with full bet data but
+   no aggregate stores. Runs once when stats are empty but bets aren't. */
+async function backfillAggregates(progressCb) {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction([STORE, STATS_STORE, TOPWINS_STORE], 'readwrite');
+    tx.objectStore(STATS_STORE).clear();
+    tx.objectStore(TOPWINS_STORE).clear();
+    const betsStore = tx.objectStore(STORE);
+    const statsStore = tx.objectStore(STATS_STORE);
+    const topStore = tx.objectStore(TOPWINS_STORE);
+
+    const stats = new Map();
+    let processed = 0;
+
+    const cursorReq = betsStore.openCursor();
+    cursorReq.onsuccess = (e) => {
+      const cursor = e.target.result;
+      if (cursor) {
+        const r = cursor.value;
+        // Normalize legacy 'won' field on the fly
+        const won = (r.payout > r.amount);
+        let s = stats.get(r.gameName);
+        if (!s) {
+          s = {
+            gameName: r.gameName,
+            totalBets: 0, totalWins: 0,
+            topMulti: 0, topWinId: null,
+            firstBet: Infinity, lastBet: 0,
+            currencyCounts: {}, netByCurrency: {},
+          };
+          stats.set(r.gameName, s);
+        }
+        s.totalBets++;
+        if (won) s.totalWins++;
+        if (r.payoutMultiplier > s.topMulti) {
+          s.topMulti = r.payoutMultiplier;
+          s.topWinId = r.id;
+        }
+        if (r.createdAt && r.createdAt < s.firstBet) s.firstBet = r.createdAt;
+        if (r.createdAt && r.createdAt > s.lastBet) s.lastBet = r.createdAt;
+        s.currencyCounts[r.currency] = (s.currencyCounts[r.currency] || 0) + 1;
+        s.netByCurrency[r.currency] = (s.netByCurrency[r.currency] || 0) + (r.payout - r.amount);
+        if (won) {
+          topStore.put({
+            gameName: r.gameName,
+            id: r.id,
+            payoutMultiplier: r.payoutMultiplier,
+            amount: r.amount,
+            payout: r.payout,
+            profit: r.payout - r.amount,
+            currency: r.currency,
+            createdAt: r.createdAt,
+          });
+        }
+        processed++;
+        if (progressCb && processed % 5000 === 0) progressCb(processed);
+        cursor.continue();
+      } else {
+        // Done iterating - write stats
+        for (const s of stats.values()) statsStore.put(s);
+      }
+    };
+    cursorReq.onerror = () => reject(cursorReq.error);
+
+    tx.oncomplete = async () => {
+      // Trim top wins for each game to TOPWINS_PER_GAME
+      for (const g of stats.keys()) await trimTopWins(g);
+      if (progressCb) progressCb(processed, true);
+      resolve(processed);
+    };
+    tx.onerror = () => reject(tx.error);
   });
 }
 
@@ -802,6 +1064,19 @@ function toUSD(amount, currency, timestamp) {
   return amount * dates[nearest];
 }
 
+function toUSDRecent(amount, currency) {
+  // Like toUSD but uses the most recent price we have. Used for summary
+  // figures where per-bet timestamp accuracy isn't important.
+  if (!amount) return 0;
+  const cur = (currency || '').toLowerCase();
+  if (cur === 'usdt' || cur === 'usdc') return amount;
+  const dates = priceCache[cur];
+  if (!dates) return null;
+  const keys = Object.keys(dates).sort();
+  if (!keys.length) return null;
+  return amount * dates[keys[keys.length - 1]];
+}
+
 function isoDate(ts) {
   if (!ts) return '';
   const d = new Date(ts);
@@ -871,22 +1146,21 @@ $$('#currency-toggle .toggle-opt').forEach(b => {
    RENDER: HEADER STATS
    ============================================================== */
 async function renderHeaderStats() {
-  const all = await getAllBets();
-  $('#stat-total').textContent = all.length.toLocaleString();
-  const games = new Set(all.map(b => b.gameName));
-  $('#stat-games').textContent = games.size;
-  // Biggest multi is based on actually-profitable bets to filter
-  // out trivial "win" payouts like 0.5x plinko
-  const wins = all.filter(b => b.won);
-  if (wins.length) {
-    const top = wins.reduce((a, b) => a.payoutMultiplier > b.payoutMultiplier ? a : b);
-    $('#stat-multi').textContent = top.payoutMultiplier.toFixed(2) + '×';
-  } else {
-    $('#stat-multi').textContent = '—';
-  }
-  if (all.length) {
-    const dates = all.map(b => b.createdAt).filter(Boolean).sort();
-    $('#stat-range').textContent = `${fmtDate(dates[0])} → ${fmtDate(dates[dates.length-1])}`;
+  // Read from precomputed game stats - no full bet scan
+  const allStats = await getAllGameStats();
+  const total = allStats.reduce((s, g) => s + g.totalBets, 0);
+  $('#stat-total').textContent = total.toLocaleString();
+  $('#stat-games').textContent = allStats.length;
+  let topMulti = 0;
+  for (const s of allStats) if (s.topMulti > topMulti) topMulti = s.topMulti;
+  $('#stat-multi').textContent = topMulti ? topMulti.toFixed(2) + '×' : '—';
+  if (allStats.length) {
+    let first = Infinity, last = 0;
+    for (const s of allStats) {
+      if (s.firstBet < first) first = s.firstBet;
+      if (s.lastBet > last) last = s.lastBet;
+    }
+    $('#stat-range').textContent = `${fmtDate(first)} → ${fmtDate(last)}`;
   } else {
     $('#stat-range').textContent = '—';
   }
@@ -896,9 +1170,9 @@ async function renderHeaderStats() {
    RENDER: OVERVIEW (per-game cards)
    ============================================================== */
 async function renderOverview() {
-  const all = await getAllBets();
+  const allStats = await getAllGameStats();
   const c = $('#overview-content');
-  if (!all.length) {
+  if (!allStats.length) {
     c.innerHTML = `<div class="empty">
       <h2>No data yet</h2>
       <p>Upload your first bet archive to get started.</p>
@@ -906,55 +1180,53 @@ async function renderOverview() {
     </div>`;
     return;
   }
-  // Group by game
-  const byGame = new Map();
-  for (const b of all) {
-    if (!byGame.has(b.gameName)) byGame.set(b.gameName, []);
-    byGame.get(b.gameName).push(b);
+  // Fetch top win records to get dates for each game's biggest win
+  const topWinsAll = await getTopWinsAllGames();
+  const topWinByGame = new Map();
+  for (const w of topWinsAll) {
+    // We sorted by multi descending, so the first hit per game is the top
+    if (!topWinByGame.has(w.gameName)) topWinByGame.set(w.gameName, w);
   }
-  const cards = [...byGame.entries()]
-    .sort((a, b) => b[1].length - a[1].length)
-    .map(([game, bets]) => {
-      const wins = bets.filter(b => b.won);
-      const topWin = wins.length
-        ? wins.reduce((a, b) => a.payoutMultiplier > b.payoutMultiplier ? a : b)
-        : null;
-      const topMulti = topWin ? topWin.payoutMultiplier : 0;
+
+  const cards = allStats
+    .sort((a, b) => b.totalBets - a.totalBets)
+    .map(s => {
+      const topWin = topWinByGame.get(s.gameName);
       const topWinDate = topWin ? fmtDate(topWin.createdAt) : '—';
-      // Date range for this game
-      const ts = bets.map(b => b.createdAt).filter(Boolean).sort();
-      const firstPlayed = ts.length ? fmtDate(ts[0]) : '—';
-      const lastPlayed = ts.length ? fmtDate(ts[ts.length-1]) : '—';
+      const firstPlayed = s.firstBet !== Infinity ? fmtDate(s.firstBet) : '—';
+      const lastPlayed = s.lastBet ? fmtDate(s.lastBet) : '—';
+
       // Most-used currency for this game
-      const curCounts = {};
-      bets.forEach(b => { curCounts[b.currency] = (curCounts[b.currency] || 0) + 1; });
-      const topCur = Object.entries(curCounts).sort((a, b) => b[1] - a[1])[0]?.[0] || '';
+      const topCur = Object.entries(s.currencyCounts || {})
+        .sort((a, b) => b[1] - a[1])[0]?.[0] || '';
+
       let netLabel, netValue, netColor;
       if (viewMode === 'usd') {
-        // Sum USD across all currencies
-        let totalProfitUSD = 0;
-        let hasMissing = false;
-        for (const b of bets) {
-          const usd = toUSD(b.profit, b.currency, b.createdAt);
-          if (usd == null) { hasMissing = true; } else { totalProfitUSD += usd; }
+        // Sum USD across currencies using net amounts from stats
+        let totalNetUSD = 0;
+        let hasAny = false;
+        for (const [cur, net] of Object.entries(s.netByCurrency || {})) {
+          // Without per-bet timestamps we use today's price as approximation
+          // for the cumulative net (good enough for an overview number).
+          const usd = toUSDRecent(net, cur);
+          if (usd != null) { totalNetUSD += usd; hasAny = true; }
         }
         netLabel = 'Net ($)';
-        netValue = hasMissing && totalProfitUSD === 0 ? 'no prices' : fmtUSDValue(totalProfitUSD);
-        netColor = totalProfitUSD >= 0 ? 'var(--accent)' : 'var(--danger)';
+        netValue = hasAny ? fmtUSDValue(totalNetUSD) : 'no prices';
+        netColor = totalNetUSD >= 0 ? 'var(--accent)' : 'var(--danger)';
       } else {
-        // Native: sum profit in the dominant currency only
-        const inCur = bets.filter(b => b.currency === topCur);
-        const net = inCur.reduce((s, b) => s + b.profit, 0);
+        const net = s.netByCurrency?.[topCur] || 0;
         netLabel = `Net (${topCur.toUpperCase()})`;
         netValue = (net >= 0 ? '+' : '') + fmtNum(net, 4);
         netColor = net >= 0 ? 'var(--accent)' : 'var(--danger)';
       }
-      return `<div class="game-card" data-game="${game}">
-        <h3>${game.replace(/-/g, ' ')}</h3>
+
+      return `<div class="game-card" data-game="${s.gameName}">
+        <h3>${s.gameName.replace(/-/g, ' ')}</h3>
         <div class="game-card-stats">
-          <div class="game-card-stat"><span class="label">Bets</span><span class="value">${bets.length.toLocaleString()}</span></div>
-          <div class="game-card-stat"><span class="label">Wins</span><span class="value">${wins.length.toLocaleString()}</span></div>
-          <div class="game-card-stat"><span class="label">Top Multi</span><span class="value green">${topMulti ? topMulti.toFixed(2) + '×' : '—'}</span></div>
+          <div class="game-card-stat"><span class="label">Bets</span><span class="value">${s.totalBets.toLocaleString()}</span></div>
+          <div class="game-card-stat"><span class="label">Wins</span><span class="value">${s.totalWins.toLocaleString()}</span></div>
+          <div class="game-card-stat"><span class="label">Top Multi</span><span class="value green">${s.topMulti ? s.topMulti.toFixed(2) + '×' : '—'}</span></div>
           <div class="game-card-stat"><span class="label">${netLabel}</span><span class="value" style="color:${netColor}">${netValue}</span></div>
         </div>
         <div class="game-card-dates">
@@ -976,9 +1248,9 @@ async function renderOverview() {
    RENDER: TOP WINS TABLE
    ============================================================== */
 async function renderWins() {
-  // Populate game filter
-  const all = await getAllBets();
-  const games = [...new Set(all.map(b => b.gameName))].sort();
+  // Populate game filter from stats (cheap)
+  const allStats = await getAllGameStats();
+  const games = allStats.map(s => s.gameName).sort();
   const sel = $('#filter-game');
   const cur = sel.value;
   sel.innerHTML = '<option value="">All games</option>' +
@@ -989,8 +1261,14 @@ async function renderWins() {
   const sortBy = $('#filter-sort').value;
   const limit = $('#filter-limit').value;
 
-  let bets = all.filter(b => b.won);
-  if (gameFilter) bets = bets.filter(b => b.gameName === gameFilter);
+  // Pull only top wins (precomputed, max 100 per game)
+  let bets;
+  if (gameFilter) {
+    bets = await getTopWinsForGame(gameFilter);
+  } else {
+    bets = await getTopWinsAllGames();
+  }
+  // All entries are already filtered to "wins" (profitable) at ingest time
 
   // In USD mode, augment with computed USD fields
   if (viewMode === 'usd') {
@@ -1239,6 +1517,57 @@ async function fetchAllPrices() {
 $('#btn-fetch-prices').addEventListener('click', fetchAllPrices);
 
 /* ==============================================================
+   REBUILD AGGREGATES
+   ============================================================== */
+$('#btn-rebuild').addEventListener('click', async () => {
+  const btn = $('#btn-rebuild');
+  const status = $('#rebuild-status');
+  btn.disabled = true;
+  status.textContent = 'Starting…';
+  try {
+    const processed = await backfillAggregates((n, done) => {
+      status.textContent = done
+        ? `Done. ${n.toLocaleString()} bets processed.`
+        : `Processing ${n.toLocaleString()} bets…`;
+    });
+    toast(`Rebuilt aggregates from ${processed.toLocaleString()} bets`);
+    await renderHeaderStats();
+    if ($('#view-overview').classList.contains('active')) renderOverview();
+    if ($('#view-wins').classList.contains('active')) renderWins();
+  } catch (e) {
+    status.textContent = 'Failed: ' + e.message;
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+/* ==============================================================
+   AUTO-BACKFILL
+   On startup, if we have bets but no aggregate stats, run a one-time
+   backfill so the upgrade from v1/v2 dashboard is seamless.
+   ============================================================== */
+async function maybeAutoBackfill() {
+  const stats = await getAllGameStats();
+  const betCount = await countBets();
+  if (betCount > 0 && stats.length === 0) {
+    // Show a banner so the user knows what's happening
+    const banner = document.createElement('div');
+    banner.id = 'auto-backfill-banner';
+    banner.innerHTML = `<div>Upgrading database — rebuilding stats from ${betCount.toLocaleString()} bets. This is a one-time process. <span id="bf-progress">starting…</span></div>`;
+    document.body.appendChild(banner);
+    try {
+      await backfillAggregates((n, done) => {
+        const p = document.getElementById('bf-progress');
+        if (p) p.textContent = done ? `done` : `${n.toLocaleString()} / ${betCount.toLocaleString()}`;
+      });
+      banner.querySelector('div').innerHTML = '✓ Upgrade complete. <button onclick="this.parentElement.parentElement.remove(); location.reload()">Refresh</button>';
+    } catch (e) {
+      banner.querySelector('div').innerHTML = 'Upgrade failed: ' + e.message;
+    }
+  }
+}
+
+/* ==============================================================
    USERSCRIPT BRIDGE
    Listens for postMessage queries from the Tampermonkey script
    running on stake.* sites. The userscript loads this page in a
@@ -1292,6 +1621,7 @@ window.addEventListener('message', async (event) => {
 (async function init() {
   await loadPriceCache();
   applyViewMode(); // sets the toggle visually
+  await maybeAutoBackfill();
   await renderHeaderStats();
   renderOverview();
 })();
