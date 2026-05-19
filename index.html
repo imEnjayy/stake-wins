@@ -339,6 +339,17 @@
     color: var(--warn);
     opacity: 0.7;
   }
+  .all-games-note {
+    background: var(--panel);
+    border: 1px solid var(--border-soft);
+    border-left: 3px solid var(--accent);
+    border-radius: 6px;
+    padding: 10px 14px;
+    margin-bottom: 12px;
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--text-dim);
+  }
 
   /* ---- Game grid (overview) ---- */
   .game-grid {
@@ -882,6 +893,104 @@ async function getTopWinsForGame(gameName) {
   });
 }
 
+/* ---- Sorted bets query for the userscript modal ----
+   The topWins precomputed store only has the top-100 by multiplier per
+   game, so it's useless for sorting by date/payout/bet across the full
+   bet history. This function streams through the raw bets store using
+   the gameName index, computing the right sort key per bet, and keeps
+   only the top N. Memory-bounded to ~limit bets at any time.
+   sort: 'multi-desc' | 'multi-asc' | 'payout-desc' | 'payout-asc' |
+         'bet-desc' | 'bet-asc' | 'profit-desc' | 'profit-asc' |
+         'date-desc' | 'date-asc'
+*/
+async function getSortedBetsForGame(gameName, sort, limit, prices) {
+  const [field, dir] = sort.split('-');
+  const desc = dir === 'desc';
+  // For payout/bet/profit, we sort by USD value (using historical prices)
+  // because the user is typically asking "biggest wins" in dollars.
+  // If price data is missing, fall back to native amount — bets without
+  // USD just sort at -Infinity (i.e. last in descending order).
+  const getKey = (b) => {
+    if (field === 'multi') return b.payoutMultiplier || 0;
+    if (field === 'date') return b.createdAt || 0;
+    let amt;
+    if (field === 'payout') amt = b.payout;
+    else if (field === 'bet') amt = b.amount;
+    else if (field === 'profit') amt = b.payout - b.amount;
+    else amt = 0;
+    return amountToUSD(amt, b.currency, b.createdAt, prices) ?? amt;
+  };
+
+  // Min-heap of size `limit` for the "top N descending" use case.
+  // For ascending, we just flip. We'll use a simpler approach: keep an
+  // array of up to limit*2 elements, sorted-insert each candidate, then
+  // truncate.
+  const cmp = desc ? (a, b) => getKey(b) - getKey(a) : (a, b) => getKey(a) - getKey(b);
+
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const idx = db.transaction(STORE, 'readonly').objectStore(STORE).index('gameName');
+    const req = idx.openCursor(IDBKeyRange.only(gameName));
+    const top = [];
+    let worstKey = desc ? -Infinity : Infinity;
+    req.onsuccess = (e) => {
+      const cursor = e.target.result;
+      if (cursor) {
+        const b = cursor.value;
+        // Skip non-wins for win-y sorts? No — users may want to sort by
+        // smallest bet/biggest loss too, so include all bets.
+        const k = getKey(b);
+        if (top.length < limit) {
+          top.push(b);
+          if (top.length === limit) {
+            top.sort(cmp);
+            worstKey = getKey(top[top.length - 1]);
+          }
+        } else {
+          // Check if this bet is "better" than our current worst
+          const isBetter = desc ? (k > worstKey) : (k < worstKey);
+          if (isBetter) {
+            top.push(b);
+            top.sort(cmp);
+            top.length = limit;
+            worstKey = getKey(top[top.length - 1]);
+          }
+        }
+        cursor.continue();
+      } else {
+        // Done
+        if (top.length < limit) top.sort(cmp);
+        // Add a `profit` field for convenience
+        for (const b of top) b.profit = b.payout - b.amount;
+        resolve(top);
+      }
+    };
+    req.onerror = () => reject(req.error);
+  });
+}
+
+// Standalone USD conversion that takes the price cache as a parameter
+// so it can be called from any context. Mirrors toUSD() above.
+function amountToUSD(amount, currency, timestamp, cache) {
+  if (!amount) return 0;
+  const cur = (currency || '').toLowerCase();
+  if (cur === 'usdt' || cur === 'usdc') return amount;
+  const dates = cache?.[cur];
+  if (!dates) return null;
+  const dateKey = isoDate(timestamp);
+  if (dates[dateKey] != null) return amount * dates[dateKey];
+  const allDates = Object.keys(dates).sort();
+  if (!allDates.length) return null;
+  const target = new Date(dateKey).getTime();
+  let nearest = allDates[0];
+  let bestDiff = Infinity;
+  for (const d of allDates) {
+    const diff = Math.abs(new Date(d).getTime() - target);
+    if (diff < bestDiff) { bestDiff = diff; nearest = d; }
+  }
+  return amount * dates[nearest];
+}
+
 /* ---- Backfill: rebuild aggregates from existing raw bets ----
    For users upgrading from earlier versions with full bet data but
    no aggregate stores. Runs once when stats are empty but bets aren't. */
@@ -1266,18 +1375,27 @@ async function renderWins() {
 
   const gameFilter = sel.value;
   const sortBy = $('#filter-sort').value;
-  const limit = $('#filter-limit').value;
+  const limitVal = $('#filter-limit').value;
+  const limit = limitVal === 'all' ? 10000 : parseInt(limitVal, 10);
 
-  // Pull only top wins (precomputed, max 100 per game)
+  // Show loading state for big queries
+  const c = $('#wins-content');
+  c.innerHTML = `<div class="empty"><p>Loading…</p></div>`;
+
   let bets;
   if (gameFilter) {
-    bets = await getTopWinsForGame(gameFilter);
+    // Properly sort the full bet history for this game
+    bets = await getSortedBetsForGame(gameFilter, sortBy, limit, priceCache);
   } else {
-    bets = await getTopWinsAllGames();
+    // Without a game filter, fall back to the precomputed top-wins store
+    // (otherwise we'd scan millions of bets). This means "All games"
+    // view is still always ranked by multiplier — we add a note.
+    const all = await getTopWinsAllGames(limit);
+    bets = all;
+    // Apply any user-requested sort client-side on this smaller set
+    sortBetsInPlace(bets, sortBy);
   }
-  // All entries are already filtered to "wins" (profitable) at ingest time
 
-  // In USD mode, augment with computed USD fields
   if (viewMode === 'usd') {
     bets = bets.map(b => ({
       ...b,
@@ -1287,26 +1405,8 @@ async function renderWins() {
     }));
   }
 
-  // Parse sort like "multi-desc" -> { field: 'multi', desc: true }
-  const [sortField, sortDir] = sortBy.split('-');
-  const desc = sortDir === 'desc';
-  const usd = viewMode === 'usd';
-  const getter = {
-    multi:  b => b.payoutMultiplier || 0,
-    payout: b => usd ? (b.payoutUSD ?? -Infinity) : (b.payout || 0),
-    bet:    b => usd ? (b.amountUSD ?? -Infinity) : (b.amount || 0),
-    profit: b => usd ? (b.profitUSD ?? -Infinity) : (b.profit || 0),
-    date:   b => b.createdAt || 0,
-  }[sortField] || (b => b.payoutMultiplier || 0);
-  bets.sort((a, b) => {
-    const av = getter(a), bv = getter(b);
-    return desc ? (bv - av) : (av - bv);
-  });
-  if (limit !== 'all') bets = bets.slice(0, parseInt(limit, 10));
-
-  const c = $('#wins-content');
   if (!bets.length) {
-    c.innerHTML = `<div class="empty"><p>No wins to show${gameFilter ? ` for ${gameFilter}` : ''}.</p></div>`;
+    c.innerHTML = `<div class="empty"><p>No bets to show${gameFilter ? ` for ${gameFilter}` : ''}.</p></div>`;
     return;
   }
 
@@ -1315,7 +1415,11 @@ async function renderWins() {
   const hdrPayout = isUSD ? 'Payout ($)' : 'Payout';
   const hdrProfit = isUSD ? 'Profit ($)' : 'Profit';
 
-  c.innerHTML = `<div class="table-wrap"><table>
+  const note = !gameFilter
+    ? `<div class="all-games-note">Showing top wins across all games. Pick a specific game to sort the full history.</div>`
+    : '';
+
+  c.innerHTML = note + `<div class="table-wrap"><table>
     <thead><tr>
       <th>#</th><th>Game</th>
       <th class="num">Multi</th>
@@ -1348,6 +1452,32 @@ async function renderWins() {
       }).join('')}
     </tbody>
   </table></div>`;
+}
+
+function sortBetsInPlace(bets, sortBy) {
+  const [field, dir] = sortBy.split('-');
+  const desc = dir === 'desc';
+  const usd = viewMode === 'usd';
+  const getter = {
+    multi:  b => b.payoutMultiplier || 0,
+    payout: b => {
+      if (!usd) return b.payout || 0;
+      return toUSD(b.payout, b.currency, b.createdAt) ?? -Infinity;
+    },
+    bet:    b => {
+      if (!usd) return b.amount || 0;
+      return toUSD(b.amount, b.currency, b.createdAt) ?? -Infinity;
+    },
+    profit: b => {
+      if (!usd) return b.profit || 0;
+      return toUSD(b.profit, b.currency, b.createdAt) ?? -Infinity;
+    },
+    date:   b => b.createdAt || 0,
+  }[field] || (b => b.payoutMultiplier || 0);
+  bets.sort((a, b) => {
+    const av = getter(a), bv = getter(b);
+    return desc ? (bv - av) : (av - bv);
+  });
 }
 
 ['#filter-game', '#filter-sort', '#filter-limit'].forEach(s => {
@@ -1596,17 +1726,17 @@ window.addEventListener('message', async (event) => {
     if (msg.type === 'ping') {
       reply({ ok: true });
     } else if (msg.type === 'topWinsForGame') {
-      // Ensure price cache is loaded before doing USD conversion
-      // (the bridge can be queried during init before loadPriceCache finishes)
       if (Object.keys(priceCache).length === 0) {
         await loadPriceCache();
       }
-      const bets = await getBetsByGame(msg.gameName);
-      const wins = bets.filter(b => b.won)
-        .sort((a, b) => b.payoutMultiplier - a.payoutMultiplier)
-        .slice(0, msg.limit || 50);
-      const enriched = wins.map(b => ({
+      // Sort options: multi-desc (default), multi-asc, payout-desc/asc,
+      // bet-desc/asc, profit-desc/asc, date-desc/asc
+      const sort = msg.sort || 'multi-desc';
+      const limit = msg.limit || 50;
+      const bets = await getSortedBetsForGame(msg.gameName, sort, limit, priceCache);
+      const enriched = bets.map(b => ({
         ...b,
+        won: b.payout > b.amount,
         amountUSD: toUSD(b.amount, b.currency, b.createdAt),
         payoutUSD: toUSD(b.payout, b.currency, b.createdAt),
         profitUSD: toUSD(b.profit, b.currency, b.createdAt),
