@@ -539,9 +539,16 @@
       <select id="filter-game"><option value="">All games</option></select>
       <label>Sort By</label>
       <select id="filter-sort">
-        <option value="multi">Multiplier</option>
-        <option value="payout">Payout</option>
-        <option value="profit">Profit</option>
+        <option value="multi-desc">Multiplier — high to low</option>
+        <option value="multi-asc">Multiplier — low to high</option>
+        <option value="payout-desc">Payout — high to low</option>
+        <option value="payout-asc">Payout — low to high</option>
+        <option value="bet-desc">Bet — high to low</option>
+        <option value="bet-asc">Bet — low to high</option>
+        <option value="profit-desc">Profit — high to low</option>
+        <option value="profit-asc">Profit — low to high</option>
+        <option value="date-desc">Date — newest first</option>
+        <option value="date-asc">Date — oldest first</option>
       </select>
       <label>Show</label>
       <select id="filter-limit">
@@ -1280,16 +1287,21 @@ async function renderWins() {
     }));
   }
 
-  const sorters = {
-    multi:  (a, b) => b.payoutMultiplier - a.payoutMultiplier,
-    payout: (a, b) => viewMode === 'usd'
-      ? (b.payoutUSD ?? -Infinity) - (a.payoutUSD ?? -Infinity)
-      : b.payout - a.payout,
-    profit: (a, b) => viewMode === 'usd'
-      ? (b.profitUSD ?? -Infinity) - (a.profitUSD ?? -Infinity)
-      : b.profit - a.profit,
-  };
-  bets.sort(sorters[sortBy] || sorters.multi);
+  // Parse sort like "multi-desc" -> { field: 'multi', desc: true }
+  const [sortField, sortDir] = sortBy.split('-');
+  const desc = sortDir === 'desc';
+  const usd = viewMode === 'usd';
+  const getter = {
+    multi:  b => b.payoutMultiplier || 0,
+    payout: b => usd ? (b.payoutUSD ?? -Infinity) : (b.payout || 0),
+    bet:    b => usd ? (b.amountUSD ?? -Infinity) : (b.amount || 0),
+    profit: b => usd ? (b.profitUSD ?? -Infinity) : (b.profit || 0),
+    date:   b => b.createdAt || 0,
+  }[sortField] || (b => b.payoutMultiplier || 0);
+  bets.sort((a, b) => {
+    const av = getter(a), bv = getter(b);
+    return desc ? (bv - av) : (av - bv);
+  });
   if (limit !== 'all') bets = bets.slice(0, parseInt(limit, 10));
 
   const c = $('#wins-content');
