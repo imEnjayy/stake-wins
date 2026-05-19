@@ -595,7 +595,7 @@
     <div class="settings-row">
       <div class="info">
         <h3>Rebuild aggregates</h3>
-        <p>Recompute game statistics and top-win lists from your stored bets. Run this once after upgrading from an older dashboard version, or any time stats look wrong.</p>
+        <p>Canonicalizes game names (merges "Mines"/"mines"/"MINES" etc.), rebuilds game stats, leaderboards, and PNL daily rollups. Run this once after upgrading from an older dashboard version, after a large import, or any time stats look wrong.</p>
         <p id="rebuild-status" style="margin-top:6px;font-family:var(--mono);font-size:11px;color:var(--text-fade)"></p>
       </div>
       <button class="btn secondary" id="btn-rebuild">Rebuild</button>
@@ -1316,17 +1316,17 @@ function normalizeBet(raw) {
   return {
     id,                                            // dedup key (Stake bet UUID)
     iid: d.iid || '',
-    gameName: d.gameName || 'unknown',
+    gameName: canonicalGameName(d.gameName),       // unify "Mines"/"mines"/"MINES" -> "mines"
     type: d.type || 'casino',
     currency: (d.currency || '').toLowerCase(),
     amount,
     payout,
     profit: payout - amount,
     payoutMultiplier: Number(d.payoutMultiplier) || 0,
-    value: Number(d.value) || 0,                   // Stake-internal value field (not reliable USD)
+    value: Number(d.value) || 0,
     createdAt: d.createdAt || (raw.created_at ? Date.parse(raw.created_at) : 0),
     nonce: d.nonce || 0,
-    won: payout > amount,                          // actually profitable (not just any payout > 0)
+    won: payout > amount,
   };
 }
 
@@ -1354,13 +1354,28 @@ let viewMode = localStorage.getItem('sw-view-mode') || 'native';
 let priceCache = {};
 
 const SUPPORTED_CURRENCIES = {
-  ltc: 'litecoin',
+  usdt: 'tether',
   btc: 'bitcoin',
   eth: 'ethereum',
+  ltc: 'litecoin',
   sol: 'solana',
+  doge: 'dogecoin',
+  bch: 'bitcoin-cash',
   xrp: 'ripple',
-  usdt: 'tether',
+  trx: 'tron',
+  eos: 'eos',
+  bnb: 'binancecoin',
   usdc: 'usd-coin',
+  ape: 'apecoin',
+  busd: 'binance-usd',
+  cro: 'crypto-com-chain',
+  dai: 'dai',
+  link: 'chainlink',
+  sand: 'the-sandbox',
+  shib: 'shiba-inu',
+  uni: 'uniswap',
+  pol: 'matic-network', // POL is the rebranded MATIC
+  trump: 'official-trump',
 };
 
 async function loadPriceCache() {
@@ -1883,16 +1898,22 @@ $('#btn-rebuild').addEventListener('click', async () => {
   btn.disabled = true;
   status.textContent = 'Starting…';
   try {
+    // Step 1: canonicalize game names so "Mines"/"mines"/"MINES" merge
+    status.textContent = 'Canonicalizing game names…';
+    await canonicalizeGameNames((msg) => { status.textContent = msg; });
+    // Step 2: rebuild stats from canonicalized data
     const processed = await backfillAggregates((n, done) => {
       status.textContent = done
         ? `Stats done. Building leaderboards…`
         : `Stats: ${n.toLocaleString()} bets…`;
     });
+    // Step 3: rebuild leaderboards
     await buildAllLeaderboards((msg) => { status.textContent = msg; });
+    // Step 4: rebuild PNL daily rollups
     status.textContent = 'Building PNL daily rollups…';
     await buildPNLDaily((msg) => { status.textContent = msg; });
     status.textContent = `Done. ${processed.toLocaleString()} bets processed.`;
-    toast(`Rebuilt aggregates, leaderboards, and PNL`);
+    toast(`Rebuilt everything`);
     await renderHeaderStats();
     if ($('#view-overview').classList.contains('active')) renderOverview();
     if ($('#view-wins').classList.contains('active')) renderWins();
