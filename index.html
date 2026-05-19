@@ -1321,13 +1321,12 @@ async function canonicalizeGameNames(progressCb) {
   });
   if (progressCb) progressCb(`Scanning ${total.toLocaleString()} bets…`);
 
-  let processed = 0;
-  let updated = 0;
-
+  // Step 1: Pass 1 - read-only scan to find which IDs need renaming
+  // (much safer than a long-running readwrite cursor on millions of rows)
+  const renames = []; // [{id, newName}, ...]
   await new Promise((resolve, reject) => {
-    const tx = db.transaction(STORE, 'readwrite');
-    const store = tx.objectStore(STORE);
-    const req = store.openCursor();
+    let scanned = 0;
+    const req = db.transaction(STORE, 'readonly').objectStore(STORE).openCursor();
     req.onsuccess = (e) => {
       const cursor = e.target.result;
       if (cursor) {
@@ -1335,13 +1334,11 @@ async function canonicalizeGameNames(progressCb) {
         const original = bet.gameName || 'unknown';
         const canonical = canonicalGameName(original);
         if (original !== canonical) {
-          bet.gameName = canonical;
-          cursor.update(bet);
-          updated++;
+          renames.push({ id: bet.id, newName: canonical });
         }
-        processed++;
-        if (progressCb && processed % 25000 === 0) {
-          progressCb(`Canonicalizing: ${processed.toLocaleString()} / ${total.toLocaleString()} (${updated.toLocaleString()} renamed)`);
+        scanned++;
+        if (progressCb && scanned % 50000 === 0) {
+          progressCb(`Scanning: ${scanned.toLocaleString()} / ${total.toLocaleString()} (${renames.length.toLocaleString()} to rename)`);
         }
         cursor.continue();
       } else {
@@ -1349,29 +1346,49 @@ async function canonicalizeGameNames(progressCb) {
       }
     };
     req.onerror = () => reject(req.error);
-    tx.onerror = () => reject(tx.error);
   });
 
-  // Clean up stale data from old gameNames in the auxiliary stores
-  // (stats / topWins / leaderboards / pnlDaily are keyed on gameName
-  // so the old uppercase keys still exist after canonicalization;
-  // we wipe them so the rebuild creates fresh entries with the
-  // canonical names).
-  await new Promise((resolve, reject) => {
-    const tx = db.transaction(
-      [STATS_STORE, TOPWINS_STORE, LEADERBOARDS_STORE, PNL_DAILY_STORE],
-      'readwrite'
-    );
-    tx.objectStore(STATS_STORE).clear();
-    tx.objectStore(TOPWINS_STORE).clear();
-    tx.objectStore(LEADERBOARDS_STORE).clear();
-    tx.objectStore(PNL_DAILY_STORE).clear();
-    tx.oncomplete = () => resolve();
-    tx.onerror = () => reject(tx.error);
-  });
+  if (renames.length === 0) {
+    if (progressCb) progressCb(`Nothing to rename (${total.toLocaleString()} bets already canonical)`);
+    return { processed: total, updated: 0 };
+  }
 
-  if (progressCb) progressCb(`Done: ${processed.toLocaleString()} bets, ${updated.toLocaleString()} renamed`);
-  return { processed, updated };
+  // Step 2: Apply renames in batches of 5000 with separate transactions.
+  // This way if anything fails, only that batch rolls back — not the
+  // whole 3.8M-row dataset.
+  const BATCH = 5000;
+  let applied = 0;
+  for (let i = 0; i < renames.length; i += BATCH) {
+    const chunk = renames.slice(i, i + BATCH);
+    await new Promise((resolve, reject) => {
+      const tx = db.transaction(STORE, 'readwrite');
+      const store = tx.objectStore(STORE);
+      let remaining = chunk.length;
+      for (const r of chunk) {
+        const getReq = store.get(r.id);
+        getReq.onsuccess = () => {
+          const bet = getReq.result;
+          if (bet) {
+            bet.gameName = r.newName;
+            store.put(bet);
+          }
+          remaining--;
+        };
+      }
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(new Error('Transaction aborted'));
+    });
+    applied += chunk.length;
+    if (progressCb) {
+      progressCb(`Renaming: ${applied.toLocaleString()} / ${renames.length.toLocaleString()}`);
+    }
+    // Yield to keep page responsive
+    await new Promise(r => setTimeout(r, 0));
+  }
+
+  if (progressCb) progressCb(`Renamed ${applied.toLocaleString()} of ${total.toLocaleString()} bets`);
+  return { processed: total, updated: applied };
 }
 
 function normalizeBet(raw) {
@@ -2022,24 +2039,61 @@ getCurrentPrices().then(() => {
 /* ==============================================================
    REBUILD AGGREGATES
    ============================================================== */
+async function autoBackupBeforeDestructive(label) {
+  const all = await getAllBets();
+  if (all.length === 0) return;
+  const blob = new Blob([JSON.stringify(all, null, 0)], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  const dt = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+  a.href = url;
+  a.download = `stake-wins-backup-${label}-${dt}.json`;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+async function clearAuxStores() {
+  // Wipe stats / topWins / leaderboards / pnlDaily but NOT bets.
+  // Used during Rebuild between canonicalize and the rebuild phases.
+  const db = await openDB();
+  await new Promise((resolve, reject) => {
+    const tx = db.transaction(
+      [STATS_STORE, TOPWINS_STORE, LEADERBOARDS_STORE, PNL_DAILY_STORE],
+      'readwrite'
+    );
+    tx.objectStore(STATS_STORE).clear();
+    tx.objectStore(TOPWINS_STORE).clear();
+    tx.objectStore(LEADERBOARDS_STORE).clear();
+    tx.objectStore(PNL_DAILY_STORE).clear();
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
 $('#btn-rebuild').addEventListener('click', async () => {
   const btn = $('#btn-rebuild');
   const status = $('#rebuild-status');
   btn.disabled = true;
   status.textContent = 'Starting…';
   try {
-    // Step 1: canonicalize game names so "Mines"/"mines"/"MINES" merge
+    // Step 0: Auto-backup before doing anything destructive
+    status.textContent = 'Auto-backing up your data first…';
+    await autoBackupBeforeDestructive('pre-rebuild');
+    // Step 1: canonicalize game names
     status.textContent = 'Canonicalizing game names…';
     await canonicalizeGameNames((msg) => { status.textContent = msg; });
-    // Step 2: rebuild stats from canonicalized data
+    // Step 2: wipe stale aux stores (separate transaction, safe)
+    status.textContent = 'Clearing stale aggregates…';
+    await clearAuxStores();
+    // Step 3: rebuild stats from canonicalized data
     const processed = await backfillAggregates((n, done) => {
       status.textContent = done
         ? `Stats done. Building leaderboards…`
         : `Stats: ${n.toLocaleString()} bets…`;
     });
-    // Step 3: rebuild leaderboards
+    // Step 4: rebuild leaderboards
     await buildAllLeaderboards((msg) => { status.textContent = msg; });
-    // Step 4: rebuild PNL daily rollups
+    // Step 5: rebuild PNL daily rollups
     status.textContent = 'Building PNL daily rollups…';
     await buildPNLDaily((msg) => { status.textContent = msg; });
     status.textContent = `Done. ${processed.toLocaleString()} bets processed.`;
@@ -2049,6 +2103,7 @@ $('#btn-rebuild').addEventListener('click', async () => {
     if ($('#view-wins').classList.contains('active')) renderWins();
   } catch (e) {
     status.textContent = 'Failed: ' + e.message;
+    toast('Rebuild failed - your backup file is in your Downloads folder', 8000);
   } finally {
     btn.disabled = false;
   }
