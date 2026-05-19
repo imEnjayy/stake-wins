@@ -1600,6 +1600,10 @@ window.addEventListener('message', async (event) => {
     } else if (msg.type === 'gameStats') {
       const bets = await getBetsByGame(msg.gameName);
       reply({ ok: true, totalBets: bets.length, totalWins: bets.filter(b => b.won).length });
+    } else if (msg.type === 'getGameNames') {
+      // Return list of all game names in the database for slug matching
+      const stats = await getAllGameStats();
+      reply({ ok: true, names: stats.map(s => s.gameName) });
     } else if (msg.type === 'ingestArchive') {
       // Bulk importer pipes raw archive arrays through this handler
       if (!Array.isArray(msg.archive)) {
@@ -1619,6 +1623,10 @@ window.addEventListener('message', async (event) => {
    INIT
    ============================================================== */
 (async function init() {
+  // Claim the named window slot so userscripts opening
+  // window.open(SITE_URL, 'stake-wins-dashboard') will reuse this
+  // tab instead of opening a new popup.
+  try { window.name = 'stake-wins-dashboard'; } catch (e) {}
   await loadPriceCache();
   applyViewMode(); // sets the toggle visually
   await maybeAutoBackfill();
