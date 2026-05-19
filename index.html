@@ -602,10 +602,10 @@
     </div>
     <div class="settings-row">
       <div class="info">
-        <h3>Fetch USD price history</h3>
-        <p>Downloads daily USD prices for LTC, BTC, ETH, SOL, XRP, USDT, USDC from CoinGecko's free API. Required for the USD view mode. Re-run weekly to refresh recent prices.</p>
+        <h3>Refresh Prices</h3>
+        <p>Fetches the current USD price for all 22 supported currencies in a single batched request to CoinGecko. Auto-refreshes every 30 minutes when the tab is open. USD values throughout the dashboard use these current prices (not historical), so refreshing here updates everything instantly.</p>
       </div>
-      <button class="btn" id="btn-fetch-prices">Fetch Prices</button>
+      <button class="btn" id="btn-fetch-prices">Refresh Prices</button>
     </div>
     <div class="settings-row">
       <div class="info">
@@ -965,26 +965,15 @@ async function getSortedBetsForGame(gameName, sort, limit, prices) {
   return top;
 }
 
-// Standalone USD conversion that takes the price cache as a parameter
-// so it can be called from any context. Mirrors toUSD() above.
-function amountToUSD(amount, currency, timestamp, cache) {
+// Convert (amount, currency) to USD using current prices.
+// Signature kept compatible with old callers (timestamp/cache args
+// are accepted but ignored).
+function amountToUSD(amount, currency, _timestamp, _cache) {
   if (!amount) return 0;
   const cur = (currency || '').toLowerCase();
-  if (cur === 'usdt' || cur === 'usdc') return amount;
-  const dates = cache?.[cur];
-  if (!dates) return null;
-  const dateKey = isoDate(timestamp);
-  if (dates[dateKey] != null) return amount * dates[dateKey];
-  const allDates = Object.keys(dates).sort();
-  if (!allDates.length) return null;
-  const target = new Date(dateKey).getTime();
-  let nearest = allDates[0];
-  let bestDiff = Infinity;
-  for (const d of allDates) {
-    const diff = Math.abs(new Date(d).getTime() - target);
-    if (diff < bestDiff) { bestDiff = diff; nearest = d; }
-  }
-  return amount * dates[nearest];
+  const price = currentPrices[cur];
+  if (price == null) return null;
+  return amount * price;
 }
 
 /* ==============================================================
@@ -1067,16 +1056,16 @@ async function buildLeaderboardsForGame(gameName, prices, progressCb) {
 }
 
 async function buildAllLeaderboards(progressCb) {
-  // Ensure prices are loaded
-  if (Object.keys(priceCache).length === 0) await loadPriceCache();
+  // Ensure current prices are loaded for USD ranking
+  await getCurrentPrices();
   // Build the __all__ first (uses global scan), then per-game
   if (progressCb) progressCb('Building global leaderboards…');
-  await buildLeaderboardsForGame('__all__', priceCache, progressCb);
+  await buildLeaderboardsForGame('__all__', null, progressCb);
   const stats = await getAllGameStats();
   for (let i = 0; i < stats.length; i++) {
     const g = stats[i];
     if (progressCb) progressCb(`Building leaderboards for ${g.gameName} (${i+1}/${stats.length})`);
-    await buildLeaderboardsForGame(g.gameName, priceCache, progressCb);
+    await buildLeaderboardsForGame(g.gameName, null, progressCb);
     // Yield to keep UI responsive
     if (i % 5 === 0) await new Promise(r => setTimeout(r, 0));
   }
@@ -1384,44 +1373,21 @@ async function loadPriceCache() {
   for (const row of rows) priceCache[row.currency] = row.dates;
 }
 
-// Convert (amount, currency, timestamp) to USD using historical price.
-// Returns null if we don't have price data for that day.
+// Convert (amount, currency) to USD using the CURRENT price.
+// The `timestamp` parameter is accepted for API compatibility with
+// older call sites but is no longer used — we always use today's price.
+// Returns null if we have no current price for that currency.
 function toUSD(amount, currency, timestamp) {
   if (!amount) return 0;
   const cur = (currency || '').toLowerCase();
-  // Stablecoins: 1:1 USD without needing price lookup
-  if (cur === 'usdt' || cur === 'usdc') return amount;
-  const dates = priceCache[cur];
-  if (!dates) return null;
-  const dateKey = isoDate(timestamp);
-  // Exact match
-  if (dates[dateKey] != null) return amount * dates[dateKey];
-  // Fall back to nearest available date (most useful for recent bets when
-  // prices haven't been refreshed yet, or older bets near the edge of our cache)
-  const allDates = Object.keys(dates).sort();
-  if (!allDates.length) return null;
-  // Find nearest by absolute date difference
-  const target = new Date(dateKey).getTime();
-  let nearest = allDates[0];
-  let bestDiff = Infinity;
-  for (const d of allDates) {
-    const diff = Math.abs(new Date(d).getTime() - target);
-    if (diff < bestDiff) { bestDiff = diff; nearest = d; }
-  }
-  return amount * dates[nearest];
+  const price = currentPrices[cur];
+  if (price == null) return null;
+  return amount * price;
 }
 
+// Alias for the legacy "approximate USD" call sites — same as toUSD now.
 function toUSDRecent(amount, currency) {
-  // Like toUSD but uses the most recent price we have. Used for summary
-  // figures where per-bet timestamp accuracy isn't important.
-  if (!amount) return 0;
-  const cur = (currency || '').toLowerCase();
-  if (cur === 'usdt' || cur === 'usdc') return amount;
-  const dates = priceCache[cur];
-  if (!dates) return null;
-  const keys = Object.keys(dates).sort();
-  if (!keys.length) return null;
-  return amount * dates[keys[keys.length - 1]];
+  return toUSD(amount, currency);
 }
 
 function isoDate(ts) {
@@ -1432,12 +1398,12 @@ function isoDate(ts) {
          String(d.getDate()).padStart(2, '0');
 }
 
-function toast(msg) {
+function toast(msg, durationMs = 2500) {
   const t = $('#toast');
   t.textContent = msg;
   t.classList.add('show');
   clearTimeout(t._timer);
-  t._timer = setTimeout(() => t.classList.remove('show'), 2500);
+  t._timer = setTimeout(() => t.classList.remove('show'), durationMs);
 }
 
 function fmtNum(n, decimals = 2) {
@@ -1828,17 +1794,30 @@ async function renderStorageInfo() {
 }
 
 async function renderPriceCacheInfo() {
-  const rows = await getAllPrices();
-  if (!rows.length) {
-    $('#price-cache-info').textContent = 'No price data yet. Click "Fetch Prices" to download.';
+  const info = $('#price-cache-info');
+  if (!info) return;
+  if (Object.keys(currentPrices).length === 0) {
+    info.innerHTML = 'No prices loaded yet. Click "Refresh Prices" or wait for auto-refresh.';
     return;
   }
-  const summary = rows.map(r => {
-    const days = Object.keys(r.dates).length;
-    return `${r.currency.toUpperCase()}: ${days}d`;
+  const lines = [];
+  const sorted = Object.entries(currentPrices).sort((a, b) => a[0].localeCompare(b[0]));
+  const priceList = sorted.map(([cur, price]) => {
+    let display;
+    if (price >= 100) display = '$' + price.toFixed(0);
+    else if (price >= 1) display = '$' + price.toFixed(2);
+    else if (price >= 0.01) display = '$' + price.toFixed(4);
+    else display = '$' + price.toExponential(2);
+    return `${cur.toUpperCase()}: ${display}`;
   }).join(' · ');
-  const latest = Math.max(...rows.map(r => r.updatedAt || 0));
-  $('#price-cache-info').textContent = `${summary} · last updated ${fmtDate(latest)}`;
+  lines.push(priceList);
+  if (currentPricesFailures.length > 0) {
+    const failList = currentPricesFailures.map(f => `${f.currency.toUpperCase()} (${f.reason})`).join(', ');
+    lines.push(`<span style="color:var(--warn)">Failed: ${failList}</span>`);
+  }
+  const ageMin = currentPricesFetchedAt ? Math.floor((Date.now() - currentPricesFetchedAt) / 60000) : 0;
+  lines.push(`<span style="color:var(--text-fade)">${currentPricesFetchedAt ? `updated ${ageMin}m ago, auto-refresh every 30m` : ''}</span>`);
+  info.innerHTML = lines.join('<br>');
 }
 
 /* ==============================================================
@@ -1846,48 +1825,121 @@ async function renderPriceCacheInfo() {
    Uses CoinGecko's free market_chart endpoint (no API key required,
    ~30 calls/min limit). Fetches 365 days of daily prices per coin.
    ============================================================== */
-async function fetchPricesForCurrency(cur, coinId) {
-  const url = `https://api.coingecko.com/api/v3/coins/${coinId}/market_chart?vs_currency=usd&days=365&interval=daily`;
+/* ==============================================================
+   CURRENT-PRICE FETCH (CoinGecko /simple/price)
+   Single batched request for all 22 currencies. Stores result as
+   a single "current prices" map. Refreshed every 30 minutes
+   automatically, or manually via Settings.
+   ============================================================== */
+const CURRENT_PRICE_TTL_MS = 30 * 60 * 1000;
+let currentPrices = {};            // { ltc: 78.42, btc: 64500, ... }
+let currentPricesFetchedAt = 0;
+let currentPricesFailures = [];    // [{ currency, coinId, reason }]
+
+async function fetchCurrentPricesBatched() {
+  const entries = Object.entries(SUPPORTED_CURRENCIES);
+  const ids = entries.map(([_, coinId]) => coinId).join(',');
+  const url = `https://api.coingecko.com/api/v3/simple/price?ids=${ids}&vs_currencies=usd`;
+
   const res = await fetch(url);
-  if (!res.ok) throw new Error(`${cur}: HTTP ${res.status}`);
-  const data = await res.json();
-  if (!data.prices || !Array.isArray(data.prices)) throw new Error(`${cur}: malformed response`);
-  const dates = {};
-  for (const [ts, price] of data.prices) {
-    const key = isoDate(ts);
-    dates[key] = price;
+  if (!res.ok) {
+    throw new Error(`CoinGecko HTTP ${res.status} ${res.statusText}`);
   }
-  await savePrices(cur, dates);
-  return Object.keys(dates).length;
+  const data = await res.json();
+  // data shape: { litecoin: { usd: 78.42 }, bitcoin: { usd: 64500 }, ... }
+
+  const prices = {};
+  const failures = [];
+  // Stablecoins are always 1.0 (CoinGecko may not return tether/usdc
+  // exactly at 1.0 but we treat them as 1:1 USD for our purposes)
+  for (const [cur, coinId] of entries) {
+    if (cur === 'usdt' || cur === 'usdc' || cur === 'busd' || cur === 'dai') {
+      prices[cur] = 1.0;
+      continue;
+    }
+    const entry = data[coinId];
+    if (entry && typeof entry.usd === 'number' && entry.usd > 0) {
+      prices[cur] = entry.usd;
+    } else {
+      failures.push({
+        currency: cur,
+        coinId,
+        reason: !entry
+          ? 'Not returned by CoinGecko (wrong ID?)'
+          : (entry.usd == null ? 'No USD price' : `Unexpected value: ${entry.usd}`),
+      });
+    }
+  }
+
+  currentPrices = prices;
+  currentPricesFetchedAt = Date.now();
+  currentPricesFailures = failures;
+  return { prices, failures };
+}
+
+async function getCurrentPrices() {
+  // Return cached if fresh, otherwise refetch
+  if (Date.now() - currentPricesFetchedAt < CURRENT_PRICE_TTL_MS && Object.keys(currentPrices).length > 0) {
+    return currentPrices;
+  }
+  try {
+    await fetchCurrentPricesBatched();
+  } catch (e) {
+    console.error('Price fetch failed:', e);
+    // Keep stale prices if we have them; otherwise empty
+  }
+  return currentPrices;
+}
+
+// Convert a crypto amount to USD using current prices.
+// Returns null only if the currency has no known price.
+function toUSDCurrent(amount, currency) {
+  if (!amount) return 0;
+  const cur = (currency || '').toLowerCase();
+  const price = currentPrices[cur];
+  if (price == null) return null;
+  return amount * price;
 }
 
 async function fetchAllPrices() {
   const btn = $('#btn-fetch-prices');
   btn.disabled = true;
   btn.textContent = 'Fetching…';
-  const entries = Object.entries(SUPPORTED_CURRENCIES);
-  let succeeded = 0, failed = 0;
-  for (let i = 0; i < entries.length; i++) {
-    const [cur, coinId] = entries[i];
-    btn.textContent = `Fetching ${cur.toUpperCase()} (${i+1}/${entries.length})…`;
-    try {
-      await fetchPricesForCurrency(cur, coinId);
-      succeeded++;
-    } catch (e) {
-      console.error(e);
-      failed++;
+  try {
+    const { prices, failures } = await fetchCurrentPricesBatched();
+    const ok = Object.keys(prices).length;
+    const failCount = failures.length;
+    if (failCount > 0) {
+      // Show specifically what failed so the user can debug
+      const failMsg = failures.map(f => `${f.currency.toUpperCase()} (${f.coinId}): ${f.reason}`).join(', ');
+      console.warn('Failed currencies:', failures);
+      toast(`Prices: ${ok} ok. Failed: ${failMsg}`, 10000);
+    } else {
+      toast(`Prices refreshed: ${ok} currencies`);
     }
-    // CoinGecko free tier: ~30 req/min, so we space out a bit
-    if (i < entries.length - 1) await new Promise(r => setTimeout(r, 2500));
+    renderPriceCacheInfo();
+    applyViewMode();
+  } catch (e) {
+    toast('Price fetch failed: ' + e.message, 8000);
   }
-  await loadPriceCache();
   btn.disabled = false;
-  btn.textContent = 'Fetch Prices';
-  toast(`Prices: ${succeeded} ok, ${failed} failed`);
-  renderPriceCacheInfo();
-  applyViewMode();
+  btn.textContent = 'Refresh Prices';
 }
 $('#btn-fetch-prices').addEventListener('click', fetchAllPrices);
+
+// Auto-refresh every 30 minutes if the tab stays open
+setInterval(() => {
+  getCurrentPrices().then(() => {
+    renderPriceCacheInfo();
+    // Re-render the current view to reflect new prices
+    if ($('#view-overview')?.classList.contains('active')) renderOverview();
+  });
+}, CURRENT_PRICE_TTL_MS);
+
+// Fetch on startup
+getCurrentPrices().then(() => {
+  renderPriceCacheInfo();
+});
 
 /* ==============================================================
    REBUILD AGGREGATES
@@ -1993,17 +2045,22 @@ window.addEventListener('message', async (event) => {
     if (msg.type === 'ping') {
       reply({ ok: true });
     } else if (msg.type === 'getLeaderboard') {
-      if (Object.keys(priceCache).length === 0) await loadPriceCache();
-      const entries = await getLeaderboard(msg.gameName, msg.category);
+      await getCurrentPrices();
+      const stored = await getLeaderboard(msg.gameName, msg.category);
+      // Recompute USD fields with CURRENT prices (stored values were
+      // computed at build time and may be stale)
+      const entries = stored.map(b => ({
+        ...b,
+        amountUSD: toUSD(b.amount, b.currency),
+        payoutUSD: toUSD(b.payout, b.currency),
+      }));
       reply({ ok: true, entries, viewMode });
     } else if (msg.type === 'getPNL') {
-      if (Object.keys(priceCache).length === 0) await loadPriceCache();
-      const data = await getPNLFast(msg.gameName, msg.mode || viewMode, priceCache);
+      await getCurrentPrices();
+      const data = await getPNLFast(msg.gameName, msg.mode || viewMode);
       reply({ ok: true, data, viewMode });
     } else if (msg.type === 'topWinsForGame') {
-      if (Object.keys(priceCache).length === 0) {
-        await loadPriceCache();
-      }
+      await getCurrentPrices();
       // Sort options: multi-desc (default), multi-asc, payout-desc/asc,
       // bet-desc/asc, profit-desc/asc, date-desc/asc
       const sort = msg.sort || 'multi-desc';
@@ -2041,12 +2098,10 @@ window.addEventListener('message', async (event) => {
    INIT
    ============================================================== */
 (async function init() {
-  // Claim the named window slot so userscripts opening
-  // window.open(SITE_URL, 'stake-wins-dashboard') will reuse this
-  // tab instead of opening a new popup.
   try { window.name = 'stake-wins-dashboard'; } catch (e) {}
-  await loadPriceCache();
-  applyViewMode(); // sets the toggle visually
+  await loadPriceCache();         // legacy historical cache (mostly empty now)
+  await getCurrentPrices();       // current prices for USD mode
+  applyViewMode();
   await maybeAutoBackfill();
   await renderHeaderStats();
   renderOverview();
