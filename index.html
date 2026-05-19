@@ -1296,6 +1296,84 @@ async function getAllPrices() {
    Stake archive format: array of { id, data: {...bet}, created_at }
    We normalize each bet to a flat row for easy querying.
    ============================================================== */
+/* ==============================================================
+   GAME NAME CANONICALIZATION
+   Stake's archive stores the same game under multiple gameName
+   values over time ("mines" lowercase vs "Mines" Title Case).
+   This canonicalizer normalizes everything to a slug-style form.
+   - canonicalGameName: pure function used during ingest
+   - canonicalizeGameNames: one-time migration over existing bets
+   ============================================================== */
+function canonicalGameName(name) {
+  return (name || 'unknown')
+    .toLowerCase()
+    .replace(/['']/g, '')        // strip apostrophes
+    .replace(/[^a-z0-9]+/g, '-') // non-alphanumeric -> dash
+    .replace(/^-+|-+$/g, '');    // trim leading/trailing dashes
+}
+
+async function canonicalizeGameNames(progressCb) {
+  const db = await openDB();
+  const total = await new Promise((resolve, reject) => {
+    const req = db.transaction(STORE, 'readonly').objectStore(STORE).count();
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+  if (progressCb) progressCb(`Scanning ${total.toLocaleString()} bets…`);
+
+  let processed = 0;
+  let updated = 0;
+
+  await new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE, 'readwrite');
+    const store = tx.objectStore(STORE);
+    const req = store.openCursor();
+    req.onsuccess = (e) => {
+      const cursor = e.target.result;
+      if (cursor) {
+        const bet = cursor.value;
+        const original = bet.gameName || 'unknown';
+        const canonical = canonicalGameName(original);
+        if (original !== canonical) {
+          bet.gameName = canonical;
+          cursor.update(bet);
+          updated++;
+        }
+        processed++;
+        if (progressCb && processed % 25000 === 0) {
+          progressCb(`Canonicalizing: ${processed.toLocaleString()} / ${total.toLocaleString()} (${updated.toLocaleString()} renamed)`);
+        }
+        cursor.continue();
+      } else {
+        resolve();
+      }
+    };
+    req.onerror = () => reject(req.error);
+    tx.onerror = () => reject(tx.error);
+  });
+
+  // Clean up stale data from old gameNames in the auxiliary stores
+  // (stats / topWins / leaderboards / pnlDaily are keyed on gameName
+  // so the old uppercase keys still exist after canonicalization;
+  // we wipe them so the rebuild creates fresh entries with the
+  // canonical names).
+  await new Promise((resolve, reject) => {
+    const tx = db.transaction(
+      [STATS_STORE, TOPWINS_STORE, LEADERBOARDS_STORE, PNL_DAILY_STORE],
+      'readwrite'
+    );
+    tx.objectStore(STATS_STORE).clear();
+    tx.objectStore(TOPWINS_STORE).clear();
+    tx.objectStore(LEADERBOARDS_STORE).clear();
+    tx.objectStore(PNL_DAILY_STORE).clear();
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+
+  if (progressCb) progressCb(`Done: ${processed.toLocaleString()} bets, ${updated.toLocaleString()} renamed`);
+  return { processed, updated };
+}
+
 function normalizeBet(raw) {
   const d = raw.data || raw; // some formats may not have the wrapper
   const id = d.id || raw.id;
