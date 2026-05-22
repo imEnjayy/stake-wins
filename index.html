@@ -720,106 +720,165 @@ function openDB() {
 
 /* ---- Raw bet store (legacy reads, kept for export/import) ---- */
 async function bulkPut(records) {
-  // For each record: insert if not already present, and update the aggregate
-  // stores at the same time. Returns { inserted, skipped }.
+  // Strategy: separate the write phase entirely from the stats phase.
+  //
+  // 1. WRITE BETS in batched put-only transactions (1000 records each).
+  //    Using `put` instead of `add` makes the operation idempotent;
+  //    we count inserted vs skipped by checking existence first in
+  //    a quick read-only pre-pass.
+  // 2. UPDATE STATS in a final separate transaction that reads existing
+  //    stats once per game, applies all deltas, writes back.
+  //
+  // This avoids IndexedDB's autocommit hazard where a long-running
+  // transaction with async nested reads can silently end before all
+  // writes complete.
+  if (!records.length) return { inserted: 0, skipped: 0 };
   const db = await openDB();
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction([STORE, STATS_STORE, TOPWINS_STORE], 'readwrite');
-    const betsStore = tx.objectStore(STORE);
-    const statsStore = tx.objectStore(STATS_STORE);
-    const topStore = tx.objectStore(TOPWINS_STORE);
 
-    let inserted = 0, skipped = 0;
-    let pending = records.length;
-    if (!pending) return resolve({ inserted, skipped });
-
-    // Batch fresh stats in memory; we'll flush at the end
-    const statsDelta = new Map(); // gameName -> stats object loaded from DB
-
-    function loadOrInitStats(game, cb) {
-      if (statsDelta.has(game)) return cb(statsDelta.get(game));
-      const r = statsStore.get(game);
-      r.onsuccess = () => {
-        const s = r.result || {
-          gameName: game,
-          totalBets: 0,
-          totalWins: 0,
-          topMulti: 0,
-          topWinId: null,
-          firstBet: Infinity,
-          lastBet: 0,
-          currencyCounts: {},
-          netByCurrency: {},
-        };
-        statsDelta.set(game, s);
-        cb(s);
+  // Phase 1: pre-pass dedup — check which IDs already exist
+  const existingIds = new Set();
+  await new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE, 'readonly');
+    const store = tx.objectStore(STORE);
+    let remaining = records.length;
+    if (!remaining) return resolve();
+    for (const r of records) {
+      const req = store.get(r.id);
+      req.onsuccess = () => {
+        if (req.result) existingIds.add(r.id);
+        if (--remaining === 0) resolve();
       };
-      r.onerror = () => cb(null);
+      req.onerror = () => {
+        if (--remaining === 0) resolve();
+      };
     }
+  });
+  const newRecords = records.filter(r => !existingIds.has(r.id));
+  const skipped = existingIds.size;
 
-    function flushStats() {
-      for (const s of statsDelta.values()) statsStore.put(s);
+  // Phase 2: write bets in batches of 1000 in their own transactions.
+  // Each batch is short and atomic; one failing won't take down others.
+  const BATCH = 1000;
+  let inserted = 0;
+  for (let i = 0; i < newRecords.length; i += BATCH) {
+    const chunk = newRecords.slice(i, i + BATCH);
+    await new Promise((resolve, reject) => {
+      const tx = db.transaction(STORE, 'readwrite');
+      const store = tx.objectStore(STORE);
+      for (const r of chunk) store.put(r);  // put = idempotent insert/update
+      tx.oncomplete = () => { inserted += chunk.length; resolve(); };
+      tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(new Error('Bet write batch aborted'));
+    });
+    // Yield to keep UI responsive
+    if (i + BATCH < newRecords.length) await new Promise(r => setTimeout(r, 0));
+  }
+
+  // Phase 3: compute stats deltas in memory from new records, then
+  // apply them in a single transaction that loads each touched game's
+  // existing stats, merges, and writes back.
+  const deltas = new Map(); // gameName -> { totalBets, totalWins, topMulti, topWinId, firstBet, lastBet, currencyCounts, netByCurrency }
+  for (const r of newRecords) {
+    let d = deltas.get(r.gameName);
+    if (!d) {
+      d = {
+        gameName: r.gameName,
+        totalBets: 0,
+        totalWins: 0,
+        topMulti: 0,
+        topWinId: null,
+        firstBet: Infinity,
+        lastBet: 0,
+        currencyCounts: {},
+        netByCurrency: {},
+      };
+      deltas.set(r.gameName, d);
     }
-
-    function maybeUpdateTopWins(rec, statsForGame) {
-      // Only profitable wins are tracked
-      if (!rec.won) return;
-      // Cheap check: is this multi big enough to even consider?
-      // We'll prune later. Always insert; we trim periodically.
-      topStore.put({
-        gameName: rec.gameName,
-        id: rec.id,
-        payoutMultiplier: rec.payoutMultiplier,
-        amount: rec.amount,
-        payout: rec.payout,
-        profit: rec.profit,
-        currency: rec.currency,
-        createdAt: rec.createdAt,
-      });
+    d.totalBets++;
+    if (r.won) d.totalWins++;
+    if (r.payoutMultiplier > d.topMulti) {
+      d.topMulti = r.payoutMultiplier;
+      d.topWinId = r.id;
     }
+    if (r.createdAt && r.createdAt < d.firstBet) d.firstBet = r.createdAt;
+    if (r.createdAt && r.createdAt > d.lastBet) d.lastBet = r.createdAt;
+    d.currencyCounts[r.currency] = (d.currencyCounts[r.currency] || 0) + 1;
+    d.netByCurrency[r.currency] = (d.netByCurrency[r.currency] || 0) + r.profit;
+  }
 
-    function processOne(r) {
-      const getReq = betsStore.get(r.id);
-      getReq.onsuccess = () => {
-        if (getReq.result) {
-          skipped++;
-          if (--pending === 0) { flushStats(); }
+  // Apply stats deltas. Read existing, merge with delta, write back.
+  await new Promise((resolve, reject) => {
+    const tx = db.transaction(STATS_STORE, 'readwrite');
+    const store = tx.objectStore(STATS_STORE);
+    const games = [...deltas.keys()];
+    let remaining = games.length;
+    if (!remaining) return resolve();
+    for (const game of games) {
+      const delta = deltas.get(game);
+      const req = store.get(game);
+      req.onsuccess = () => {
+        const existing = req.result;
+        let merged;
+        if (existing) {
+          merged = {
+            gameName: game,
+            totalBets: (existing.totalBets || 0) + delta.totalBets,
+            totalWins: (existing.totalWins || 0) + delta.totalWins,
+            topMulti: Math.max(existing.topMulti || 0, delta.topMulti),
+            topWinId: delta.topMulti > (existing.topMulti || 0) ? delta.topWinId : existing.topWinId,
+            firstBet: Math.min(existing.firstBet || Infinity, delta.firstBet),
+            lastBet: Math.max(existing.lastBet || 0, delta.lastBet),
+            currencyCounts: { ...(existing.currencyCounts || {}) },
+            netByCurrency: { ...(existing.netByCurrency || {}) },
+          };
+          for (const [c, n] of Object.entries(delta.currencyCounts)) {
+            merged.currencyCounts[c] = (merged.currencyCounts[c] || 0) + n;
+          }
+          for (const [c, n] of Object.entries(delta.netByCurrency)) {
+            merged.netByCurrency[c] = (merged.netByCurrency[c] || 0) + n;
+          }
         } else {
-          betsStore.add(r);
-          inserted++;
-          loadOrInitStats(r.gameName, (s) => {
-            if (s) {
-              s.totalBets++;
-              if (r.won) s.totalWins++;
-              if (r.payoutMultiplier > s.topMulti) {
-                s.topMulti = r.payoutMultiplier;
-                s.topWinId = r.id;
-              }
-              if (r.createdAt && r.createdAt < s.firstBet) s.firstBet = r.createdAt;
-              if (r.createdAt && r.createdAt > s.lastBet) s.lastBet = r.createdAt;
-              s.currencyCounts[r.currency] = (s.currencyCounts[r.currency] || 0) + 1;
-              s.netByCurrency[r.currency] = (s.netByCurrency[r.currency] || 0) + r.profit;
-              maybeUpdateTopWins(r, s);
-            }
-            if (--pending === 0) { flushStats(); }
-          });
+          merged = delta;
         }
+        store.put(merged);
+        if (--remaining === 0) {} // resolve via tx.oncomplete
       };
-      getReq.onerror = () => {
-        if (--pending === 0) { flushStats(); }
-      };
+      req.onerror = () => { if (--remaining === 0) {} };
     }
-
-    for (const r of records) processOne(r);
-
-    tx.oncomplete = async () => {
-      // Trim top wins down to TOPWINS_PER_GAME per game (only games we touched)
-      const touchedGames = [...statsDelta.keys()];
-      for (const g of touchedGames) await trimTopWins(g);
-      resolve({ inserted, skipped });
-    };
+    tx.oncomplete = () => resolve();
     tx.onerror = () => reject(tx.error);
   });
+
+  // Phase 4: top wins update (per-batch, separate transactions)
+  // Only insert wins for new records; trim per game at the end.
+  const wins = newRecords.filter(r => r.won);
+  if (wins.length) {
+    for (let i = 0; i < wins.length; i += BATCH) {
+      const chunk = wins.slice(i, i + BATCH);
+      await new Promise((resolve, reject) => {
+        const tx = db.transaction(TOPWINS_STORE, 'readwrite');
+        const store = tx.objectStore(TOPWINS_STORE);
+        for (const r of chunk) {
+          store.put({
+            gameName: r.gameName,
+            id: r.id,
+            payoutMultiplier: r.payoutMultiplier,
+            amount: r.amount,
+            payout: r.payout,
+            profit: r.profit,
+            currency: r.currency,
+            createdAt: r.createdAt,
+          });
+        }
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => reject(tx.error);
+      });
+    }
+    // Trim each touched game's top wins
+    for (const g of deltas.keys()) await trimTopWins(g);
+  }
+
+  return { inserted, skipped };
 }
 
 async function trimTopWins(gameName) {
